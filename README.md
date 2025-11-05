@@ -1,0 +1,1 @@
+# Karachi_10Pearl_aqi

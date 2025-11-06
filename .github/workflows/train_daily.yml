@@ -1,5 +1,6 @@
 # Daily training workflow — retrain/evaluate and register model
-# Updated to run train.py from repo root (falls back to src/train.py) and include debug listing.
+# Updated to prefer running `train.py` from repository root (falls back to src/train.py),
+# to print repository layout and models/ listing for debugging, and to keep LFS enabled.
 
 on:
   schedule:
@@ -49,9 +50,7 @@ jobs:
           OPENWEATHER_API_KEY: ${{ secrets.OPENWEATHER_API_KEY }}
         run: |
           set -euo pipefail
-          # sanitize host (strip http(s) scheme and trailing slashes)
           HOST_SANITIZED="$(printf '%s' "$HOPSWORKS_HOST_RAW" | sed -e 's~https\?://~~I' -e 's:/*$::')"
-
           : > .env
           printf "HOPSWORKS_HOST=%s\n" "$HOST_SANITIZED" >> .env
           printf "HOPSWORKS_API_KEY=%s\n" "$HOPSWORKS_API_KEY" >> .env
@@ -59,15 +58,11 @@ jobs:
           printf "HOPSWORKS_FEATURE_GROUP=%s\n" "$HOPSWORKS_FEATURE_GROUP" >> .env
           printf "HOPSWORKS_FEATURE_GROUP_VERSION=%s\n" "$HOPSWORKS_FEATURE_GROUP_VERSION" >> .env
           printf "OPENWEATHER_API_KEY=%s\n" "$OPENWEATHER_API_KEY" >> .env
-
-          # show redacted preview for debugging
           echo ".env preview (keys only):"
           sed -n '1,200p' .env | sed -e 's/=.*/=<REDACTED>/g'
         shell: bash
 
-      - name: Optional:Hopsworks login diagnostic
-        # This helps catch misconfigured host / api key early and surfaces a clear error in workflow logs.
-        # It is optional; remove if you prefer not to call hopsworks from CI.
+      - name: Optional: Hopsworks login diagnostic
         run: |
           set -euo pipefail
           python - <<'PY'
@@ -91,22 +86,28 @@ jobs:
           set -euo pipefail
           mkdir -p logs artifacts
           echo "Running training script..."
-          # Debug: show repository layout so we can confirm where train.py is
+          # Debug listing so we can see where files are on the runner
+          echo "Working directory:"
           pwd
+          echo
           echo "Top-level files:"
           ls -la
+          echo
           echo "Contents of src/ (if exists):"
           ls -la src || true
-          # Run training from repo root (preferred). If train.py is in src/, use that.
+          echo
+          echo "Contents of models/ (if exists):"
+          ls -la models || true
+          echo
+          # Prefer repo root train.py (matches your repo); fallback to src/
           if [ -f "train.py" ]; then
             echo "Found train.py at repository root — running python train.py"
             python train.py 2>&1 | tee logs/train.log
           elif [ -f "src/train.py" ]; then
-            echo "train.py not found at repo root, found src/train.py — running python src/train.py"
+            echo "Found src/train.py — running python src/train.py"
             python src/train.py 2>&1 | tee logs/train.log
           else
             echo "ERROR: train.py not found at repo root or src/; aborting."
-            echo "Repository layout (recursive):"
             ls -R .
             exit 2
           fi
@@ -136,5 +137,3 @@ jobs:
       - name: Post Checkout repository
         if: always()
         run: echo "Done."
-
-    # end of job

@@ -91,7 +91,21 @@ jobs:
           set -euo pipefail
           mkdir -p logs artifacts
           echo "Running training script..."
-          python src/train.py 2>&1 | tee logs/train.log
+          # Debug: show repository layout so we can confirm where train.py is
+          pwd
+          ls -la
+          echo "Contents of src/ (if exists):"
+          ls -la src || true
+          # Run training from repo root (adjust if your script is in src/)
+          if [ -f "train.py" ]; then
+            python train.py 2>&1 | tee logs/train.log
+          elif [ -f "src/train.py" ]; then
+            python src/train.py 2>&1 | tee logs/train.log
+          else
+            echo "ERROR: train.py not found at repo root or src/; aborting."
+            ls -R .
+            exit 2
+          fi
         shell: bash
 
       - name: Upload training logs & artifacts

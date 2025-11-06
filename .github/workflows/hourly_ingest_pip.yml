@@ -39,20 +39,16 @@ jobs:
           sudo apt-get install -y librdkafka-dev build-essential || true
           python -m pip install --upgrade pip setuptools wheel
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          # Ensure dotenv is available (explicit fallback)
+          # ensure python-dotenv available even if requirements install skipped for some reason
           pip install python-dotenv
         shell: bash
 
-      - name: Prepare .env from secrets (safe, no heredoc)
+      - name: Prepare .env from repository secret 'AQI'
+        # NOTE: this step assumes you have stored the entire multi-line .env content in the repository secret named 'AQI' (case-sensitive).
+        # If 'AQI' only contains a single value (e.g. only the API key), replace this step with the mapping variant and tell me and I'll provide it.
         run: |
-          printf "HOPSWORKS_API_KEY=%s\n" "${{ secrets.HOPSWORKS_API_KEY }}" > .env
-          printf "OPENWEATHER_API_KEY=%s\n" "${{ secrets.OPENWEATHER_API_KEY }}" >> .env
-          printf "HOPSWORKS_HOST=%s\n" "${{ secrets.HOPSWORKS_HOST }}" >> .env
-          printf "HOPSWORKS_PROJECT_ID=%s\n" "${{ secrets.HOPSWORKS_PROJECT_ID }}" >> .env
-          printf "HOPSWORKS_FEATURE_GROUP=%s\n" "${{ secrets.HOPSWORKS_FEATURE_GROUP }}" >> .env
-          printf "HOPSWORKS_FEATURE_GROUP_VERSION=%s\n" "${{ secrets.HOPSWORKS_FEATURE_GROUP_VERSION }}" >> .env
-          # optional secret, only include if set in repo secrets (empty lines are okay)
-          printf "PIPELINE_TIMEZONE=%s\n" "${{ secrets.PIPELINE_TIMEZONE }}" >> .env
+          printf "%s\n" "${{ secrets.AQI }}" > .env
+          echo "Wrote .env from secrets.AQI (kept values hidden)"
         shell: bash
 
       - name: Run feature pipeline (fetch & ingest)
@@ -61,7 +57,6 @@ jobs:
           set -euo pipefail
           mkdir -p logs
           echo "Running feature pipeline..."
-          # scripts are at repository root
           python run_feature_pipeline.py 2>&1 | tee logs/run_feature_pipeline.log
         shell: bash
 

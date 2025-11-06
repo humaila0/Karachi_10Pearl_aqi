@@ -1,4 +1,5 @@
 # Daily training workflow — retrain/evaluate and register model
+# Updated: sanitize HOPSWORKS_HOST when writing .env and add an optional Hopsworks login diagnostic step.
 on:
   schedule:
     - cron: '0 2 * * *'  # Daily at 02:00 UTC
@@ -37,14 +38,61 @@ jobs:
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
         shell: bash
 
-      - name: Prepare .env from secrets
+      - name: Prepare .env from secrets (sanitized)
+        # This step strips any leading "http(s)://" and trailing slashes from HOPSWORKS_HOST so the client won't build invalid base URLs.
+        env:
+          HOPSWORKS_HOST_RAW: ${{ secrets.HOPSWORKS_HOST }}
+          HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
+          HOPSWORKS_PROJECT_ID: ${{ secrets.HOPSWORKS_PROJECT_ID }}
+          HOPSWORKS_FEATURE_GROUP: ${{ secrets.HOPSWORKS_FEATURE_GROUP }}
+          HOPSWORKS_FEATURE_GROUP_VERSION: ${{ secrets.HOPSWORKS_FEATURE_GROUP_VERSION }}
+          OPENWEATHER_API_KEY: ${{ secrets.OPENWEATHER_API_KEY }}
         run: |
-          printf "HOPSWORKS_API_KEY=%s\n" "${{ secrets.HOPSWORKS_API_KEY }}" > .env
-          printf "HOPSWORKS_HOST=%s\n" "${{ secrets.HOPSWORKS_HOST }}" >> .env
-          printf "HOPSWORKS_PROJECT_ID=%s\n" "${{ secrets.HOPSWORKS_PROJECT_ID }}" >> .env
-          printf "HOPSWORKS_FEATURE_GROUP=%s\n" "${{ secrets.HOPSWORKS_FEATURE_GROUP }}" >> .env
-          printf "HOPSWORKS_FEATURE_GROUP_VERSION=%s\n" "${{ secrets.HOPSWORKS_FEATURE_GROUP_VERSION }}" >> .env
+          set -euo pipefail
+          # sanitize host (strip http(s) scheme and trailing slashes)
+          HOST_SANITIZED="$(printf '%s' "$HOPSWORKS_HOST_RAW" | sed -e 's~https\?://~~I' -e 's:/*$::')"
+
+          : > .env
+          printf "HOPSWORKS_HOST=%s\n" "$HOST_SANITIZED" >> .env
+          printf "HOPSWORKS_API_KEY=%s\n" "$HOPSWORKS_API_KEY" >> .env
+          printf "HOPSWORKS_PROJECT_ID=%s\n" "$HOPSWORKS_PROJECT_ID" >> .env
+          printf "HOPSWORKS_FEATURE_GROUP=%s\n" "$HOPSWORKS_FEATURE_GROUP" >> .env
+          printf "HOPSWORKS_FEATURE_GROUP_VERSION=%s\n" "$HOPSWORKS_FEATURE_GROUP_VERSION" >> .env
+          printf "OPENWEATHER_API_KEY=%s\n" "$OPENWEATHER_API_KEY" >> .env
+
+          # optional: add model registry info if you use it
+          if [ -n "${{ secrets.HOPSWORKS_MODEL_NAME || '' }}" ]; then
+            printf "HOPSWORKS_MODEL_NAME=%s\n" "${{ secrets.HOPSWORKS_MODEL_NAME }}" >> .env || true
+          fi
+          if [ -n "${{ secrets.HOPSWORKS_MODEL_VERSION || '' }}" ]; then
+            printf "HOPSWORKS_MODEL_VERSION=%s\n" "${{ secrets.HOPSWORKS_MODEL_VERSION }}" >> .env || true
+          fi
+
+          # show redacted preview for debugging
+          echo ".env preview (keys only):"
+          sed -n '1,200p' .env | sed -e 's/=.*/=<REDACTED>/g'
         shell: bash
+
+      - name: Optional: Hopsworks login diagnostic
+        # This helps catch misconfigured host / api key early and surfaces a clear error in workflow logs.
+        # It is optional; remove if you prefer not to call hopsworks from CI.
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+import os, traceback
+from dotenv import load_dotenv
+load_dotenv()
+try:
+    import hopsworks
+    project = hopsworks.login()
+    print("Hopsworks login OK. Project id/name:", getattr(project, "project_id", None), getattr(project, "project_name", None))
+except Exception as e:
+    print("Hopsworks login diagnostic failed:", e)
+    traceback.print_exc()
+    # do not fail the workflow here (training may still run locally), but leave the failure visible.
+PY
+        shell: bash
+        continue-on-error: true
 
       - name: Run training
         id: train

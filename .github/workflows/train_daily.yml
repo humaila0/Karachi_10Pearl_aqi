@@ -1,5 +1,5 @@
 # Daily training workflow — retrain/evaluate and register model
-# Fixed YAML syntax error (heredoc / indentation) around the Hopsworks diagnostic step.
+# Updated to run train.py from repo root (falls back to src/train.py) and include debug listing.
 
 on:
   schedule:
@@ -93,16 +93,20 @@ jobs:
           echo "Running training script..."
           # Debug: show repository layout so we can confirm where train.py is
           pwd
+          echo "Top-level files:"
           ls -la
           echo "Contents of src/ (if exists):"
           ls -la src || true
-          # Run training from repo root (adjust if your script is in src/)
+          # Run training from repo root (preferred). If train.py is in src/, use that.
           if [ -f "train.py" ]; then
+            echo "Found train.py at repository root — running python train.py"
             python train.py 2>&1 | tee logs/train.log
           elif [ -f "src/train.py" ]; then
+            echo "train.py not found at repo root, found src/train.py — running python src/train.py"
             python src/train.py 2>&1 | tee logs/train.log
           else
             echo "ERROR: train.py not found at repo root or src/; aborting."
+            echo "Repository layout (recursive):"
             ls -R .
             exit 2
           fi
@@ -115,3 +119,22 @@ jobs:
           path: |
             logs
             artifacts
+
+      - name: Post Cache pip
+        if: always()
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Post Set up Python
+        if: always()
+        run: echo "Done."
+
+      - name: Post Checkout repository
+        if: always()
+        run: echo "Done."
+
+    # end of job

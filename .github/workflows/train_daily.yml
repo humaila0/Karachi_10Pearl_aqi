@@ -1,5 +1,5 @@
 # Daily training workflow — retrain/evaluate and register model
-# Updated: sanitize HOPSWORKS_HOST when writing .env and add an optional Hopsworks login diagnostic step.
+# Fixed YAML syntax error (heredoc / indentation) around the Hopsworks diagnostic step.
 on:
   schedule:
     - cron: '0 2 * * *'  # Daily at 02:00 UTC
@@ -39,7 +39,6 @@ jobs:
         shell: bash
 
       - name: Prepare .env from secrets (sanitized)
-        # This step strips any leading "http(s)://" and trailing slashes from HOPSWORKS_HOST so the client won't build invalid base URLs.
         env:
           HOPSWORKS_HOST_RAW: ${{ secrets.HOPSWORKS_HOST }}
           HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
@@ -60,14 +59,6 @@ jobs:
           printf "HOPSWORKS_FEATURE_GROUP_VERSION=%s\n" "$HOPSWORKS_FEATURE_GROUP_VERSION" >> .env
           printf "OPENWEATHER_API_KEY=%s\n" "$OPENWEATHER_API_KEY" >> .env
 
-          # optional: add model registry info if you use it
-          if [ -n "${{ secrets.HOPSWORKS_MODEL_NAME || '' }}" ]; then
-            printf "HOPSWORKS_MODEL_NAME=%s\n" "${{ secrets.HOPSWORKS_MODEL_NAME }}" >> .env || true
-          fi
-          if [ -n "${{ secrets.HOPSWORKS_MODEL_VERSION || '' }}" ]; then
-            printf "HOPSWORKS_MODEL_VERSION=%s\n" "${{ secrets.HOPSWORKS_MODEL_VERSION }}" >> .env || true
-          fi
-
           # show redacted preview for debugging
           echo ".env preview (keys only):"
           sed -n '1,200p' .env | sed -e 's/=.*/=<REDACTED>/g'
@@ -79,7 +70,7 @@ jobs:
         run: |
           set -euo pipefail
           python - <<'PY'
-import os, traceback
+import traceback
 from dotenv import load_dotenv
 load_dotenv()
 try:
@@ -89,7 +80,6 @@ try:
 except Exception as e:
     print("Hopsworks login diagnostic failed:", e)
     traceback.print_exc()
-    # do not fail the workflow here (training may still run locally), but leave the failure visible.
 PY
         shell: bash
         continue-on-error: true

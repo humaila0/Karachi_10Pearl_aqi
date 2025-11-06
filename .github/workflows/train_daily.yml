@@ -83,7 +83,7 @@ jobs:
               traceback.print_exc()
           PY
         shell: bash
-        continue-on-error:true
+        continue-on-error: true
 
       - name: Run training
         id: train

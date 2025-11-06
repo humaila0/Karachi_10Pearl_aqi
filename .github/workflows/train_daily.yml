@@ -1,5 +1,8 @@
 # Daily training workflow — retrain/evaluate and register model
-# Fixed: correct indentation, terminated heredoc, robust training invocation.
+# Updated to avoid common runtime errors:
+# - Install a modern scikit-learn wheel so mean_squared_error(..., squared=False) is available
+# - Make Hopsworks diagnostic non-networking (check presence of secrets only)
+# - Robust training invocation that prefers repo-root train.py and prints debug listing
 
 on:
   schedule:
@@ -33,10 +36,14 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pip-
 
-      - name: Install dependencies
+      - name: Install dependencies (incl. compatible scikit-learn)
         run: |
-          python -m pip install --upgrade pip
+          set -euo pipefail
+          python -m pip install --upgrade pip wheel setuptools
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          # Ensure a modern scikit-learn is installed so runtime APIs (e.g. mean_squared_error(..., squared=False))
+          # are available. This avoids TypeError from older scikit-learn on the runner.
+          pip install --upgrade "scikit-learn>=1.0"
         shell: bash
 
       - name: Prepare .env from secrets (sanitized)
@@ -60,28 +67,30 @@ jobs:
           printf "HOPSWORKS_FEATURE_GROUP_VERSION=%s\n" "$HOPSWORKS_FEATURE_GROUP_VERSION" >> .env
           printf "OPENWEATHER_API_KEY=%s\n" "$OPENWEATHER_API_KEY" >> .env
 
+          # show redacted preview for debugging (no secrets printed)
           echo ".env preview (keys only):"
           sed -n '1,200p' .env | sed -e 's/=.*/=<REDACTED>/g'
         shell: bash
 
-      - name: Optional:Hopsworks login diagnostic
-        # Optional diagnostic only; won't fail the workflow (continue-on-error: true)
+      - name: Optional: HOPSWORKS secrets presence check (no network)
+        # This avoids making network calls during CI. It only verifies that required secrets are present.
         run: |
           set -euo pipefail
-          python - <<'PY'
-          import traceback
-          from dotenv import load_dotenv
-          load_dotenv()
-          try:
-              import hopsworks
-              project = hopsworks.login()
-              print("Hopsworks login OK. Project id/name:",
-                    getattr(project, "project_id", None),
-                    getattr(project, "project_name", None))
-          except Exception as e:
-              print("Hopsworks login diagnostic failed:", e)
-              traceback.print_exc()
-          PY
+          echo "HOPSWORKS_HOST set: ${HOPSWORKS_HOST_RAW:+yes}"
+          if [ -z "${HOPSWORKS_API_KEY:-}" ]; then
+            echo "HOPSWORKS_API_KEY: NOT SET"
+          else
+            echo "HOPSWORKS_API_KEY: present (redacted)"
+          fi
+          if [ -z "${OPENWEATHER_API_KEY:-}" ]; then
+            echo "OPENWEATHER_API_KEY: NOT SET"
+          else
+            echo "OPENWEATHER_API_KEY: present (redacted)"
+          fi
+        env:
+          HOPSWORKS_HOST_RAW: ${{ secrets.HOPSWORKS_HOST }}
+          HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
+          OPENWEATHER_API_KEY: ${{ secrets.OPENWEATHER_API_KEY }}
         shell: bash
         continue-on-error: true
 
@@ -92,17 +101,10 @@ jobs:
           mkdir -p logs artifacts
           echo "Running training script..."
           # Debug listing so we can see where files are on the runner
-          echo "Working directory:"
-          pwd
-          echo
-          echo "Top-level files:"
-          ls -la
-          echo
-          echo "Contents of src/ (if exists):"
-          ls -la src || true
-          echo
-          echo "Contents of models/ (if exists):"
-          ls -la models || true
+          echo "Working directory:"; pwd
+          echo "Top-level files:"; ls -la
+          echo "Contents of src/ (if exists):"; ls -la src || true
+          echo "Contents of models/ (if exists):"; ls -la models || true
           echo
           # Prefer repo root train.py (matches your repo); fallback to src/
           if [ -f "train.py" ]; then
@@ -119,6 +121,7 @@ jobs:
         shell: bash
 
       - name: Upload training logs & artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: daily-train-artifacts

@@ -64,7 +64,7 @@ jobs:
           sed -n '1,200p' .env | sed -e 's/=.*/=<REDACTED>/g'
         shell: bash
 
-      - name: Optional: Hopsworks login diagnostic
+      - name: Optional:Hopsworks login diagnostic
         # Optional diagnostic only; won't fail the workflow (continue-on-error: true)
         run: |
           set -euo pipefail

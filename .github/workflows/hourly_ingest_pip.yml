@@ -40,6 +40,7 @@ jobs:
 
       - name: Prepare .env from secrets (safe, no heredoc)
         run: |
+          # write .env using printf to avoid heredoc indentation issues in YAML editors
           printf "HOPSWORKS_API_KEY=%s\n" "${{ secrets.HOPSWORKS_API_KEY }}" > .env
           printf "OPENWEATHER_API_KEY=%s\n" "${{ secrets.OPENWEATHER_API_KEY }}" >> .env
           printf "HOPSWORKS_HOST=%s\n" "${{ secrets.HOPSWORKS_HOST }}" >> .env
@@ -55,7 +56,7 @@ jobs:
           set -euo pipefail
           mkdir -p logs
           echo "Running feature pipeline..."
-          python src/run_feature_pipeline.py 2>&1 | tee logs/run_feature_pipeline.log
+          python run_feature_pipeline.py 2>&1 | tee logs/run_feature_pipeline.log
         shell: bash
 
       - name: Run predictions
@@ -65,7 +66,7 @@ jobs:
           set -euo pipefail
           mkdir -p artifacts predictions logs
           echo "Running prediction script..."
-          python src/predict.py 2>&1 | tee logs/predict_output.txt || true
+          python predict.py 2>&1 | tee logs/predict_output.txt || true
           if [ -f predictions.csv ]; then mv -f predictions.csv artifacts/ || true; fi
         shell: bash
 

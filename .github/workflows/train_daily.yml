@@ -72,7 +72,7 @@ jobs:
           sed -n '1,200p' .env | sed -e 's/=.*/=<REDACTED>/g'
         shell: bash
 
-      - name: Optional: HOPSWORKS secrets presence check (no network)
+      - name: Optional:HOPSWORKS secrets presence check (no network)
         # This avoids making network calls during CI. It only verifies that required secrets are present.
         run: |
           set -euo pipefail

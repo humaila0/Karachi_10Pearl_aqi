@@ -1,4 +1,4 @@
-# Hourly feature ingest + prediction -> keeps feature store & predictions fresh for dashboard
+# Hourly feature ingest + prediction (updated to prefer RandomForest from Hopsworks)
 on:
   schedule:
     - cron: '0 * * * *'   # At the top of every hour (UTC)
@@ -45,7 +45,6 @@ jobs:
 
       - name: Prepare .env from repository secret 'AQI'
         # NOTE: this step assumes you have stored the entire multi-line .env content in the repository secret named 'AQI' (case-sensitive).
-        # If 'AQI' only contains a single value (e.g. only the API key), replace this step with the mapping variant and tell me and I'll provide it.
         run: |
           printf "%s\n" "${{ secrets.AQI }}" > .env
           echo "Wrote .env from secrets.AQI (kept values hidden)"
@@ -60,15 +59,33 @@ jobs:
           python run_feature_pipeline.py 2>&1 | tee logs/run_feature_pipeline.log
         shell: bash
 
-      - name: Run predictions
+      - name: Run predictions (use RandomForest from Hopsworks)
         id: predict
         continue-on-error: true
+        env:
+          # Force model selection policy: prefer Hopsworks artifacts, prefer RF model
+          MODEL_SOURCE: "hopsworks"
+          PREFERRED_MODEL: "rf"
+          # Map Hopsworks/OpenWeather secrets if you have them separately in Actions secrets.
+          # If your .env (secret 'AQI') already contains these values this is optional.
+          HOPSWORKS_HOST: ${{ secrets.HOPSWORKS_HOST }}
+          HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
+          HOPSWORKS_PROJECT_ID: ${{ secrets.HOPSWORKS_PROJECT_ID }}
+          HOPSWORKS_FEATURE_GROUP: ${{ secrets.HOPSWORKS_FEATURE_GROUP }}
+          HOPSWORKS_FEATURE_GROUP_VERSION: ${{ secrets.HOPSWORKS_FEATURE_GROUP_VERSION }}
+          OPENWEATHER_API_KEY: ${{ secrets.OPENWEATHER_API_KEY }}
         run: |
           set -euo pipefail
           mkdir -p artifacts predictions logs
-          echo "Running prediction script..."
+          echo "Running prediction script (MODEL_SOURCE=$MODEL_SOURCE, PREFERRED_MODEL=$PREFERRED_MODEL)..."
+          # run predict.py; keep output in logs and move produced predictions.csv to artifacts
           python predict.py 2>&1 | tee logs/predict_output.txt || true
           if [ -f predictions.csv ]; then mv -f predictions.csv artifacts/ || true; fi
+          # Report which model files exist on runner (debug)
+          echo "Local models/ listing (for debug):"
+          ls -la models || true
+          echo "Predict logs head:"
+          head -n 200 logs/predict_output.txt || true
         shell: bash
 
       - name: Upload logs & artifacts

@@ -1,4 +1,4 @@
-# Hourly feature ingest + prediction (updated to prefer RandomForest from Hopsworks)
+# Hourly feature ingest + prediction (force use of RandomForest from Hopsworks)
 on:
   schedule:
     - cron: '0 * * * *'   # At the top of every hour (UTC)
@@ -10,7 +10,7 @@ concurrency:
 
 jobs:
   ingest_and_predict:
-    name: Ingest features and produce predictions
+    name: Ingest features and produce predictions (RF only)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -35,19 +35,16 @@ jobs:
       - name: Install dependencies (including system libs for confluent-kafka)
         run: |
           sudo apt-get update -y
-          # Install librdkafka and build tools for confluent-kafka if required
           sudo apt-get install -y librdkafka-dev build-essential || true
           python -m pip install --upgrade pip setuptools wheel
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          # ensure python-dotenv available even if requirements install skipped for some reason
           pip install python-dotenv
         shell: bash
 
       - name: Prepare .env from repository secret 'AQI'
-        # NOTE: this step assumes you have stored the entire multi-line .env content in the repository secret named 'AQI' (case-sensitive).
         run: |
           printf "%s\n" "${{ secrets.AQI }}" > .env
-          echo "Wrote .env from secrets.AQI (kept values hidden)"
+          echo "Wrote .env from secrets.AQI (values kept hidden)"
         shell: bash
 
       - name: Run feature pipeline (fetch & ingest)
@@ -59,15 +56,16 @@ jobs:
           python run_feature_pipeline.py 2>&1 | tee logs/run_feature_pipeline.log
         shell: bash
 
-      - name: Run predictions (use RandomForest from Hopsworks)
+      - name: Run predictions (force RandomForest from Hopsworks)
         id: predict
         continue-on-error: true
         env:
-          # Force model selection policy: prefer Hopsworks artifacts, prefer RF model
+          # Force model selection policy: always try Hopsworks and use the RF model
           MODEL_SOURCE: "hopsworks"
           PREFERRED_MODEL: "rf"
-          # Map Hopsworks/OpenWeather secrets if you have them separately in Actions secrets.
-          # If your .env (secret 'AQI') already contains these values this is optional.
+          # Use the exact RF model name you uploaded to Hopsworks (update if different)
+          HOPSWORKS_MODEL_NAME: "aqi_rf_standard_aqi_next_24h_20251030T153032Z"
+          # Hopsworks / OpenWeather secrets (map from Actions secrets). Optional if .env already contains them.
           HOPSWORKS_HOST: ${{ secrets.HOPSWORKS_HOST }}
           HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
           HOPSWORKS_PROJECT_ID: ${{ secrets.HOPSWORKS_PROJECT_ID }}
@@ -77,11 +75,11 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p artifacts predictions logs
-          echo "Running prediction script (MODEL_SOURCE=$MODEL_SOURCE, PREFERRED_MODEL=$PREFERRED_MODEL)..."
-          # run predict.py; keep output in logs and move produced predictions.csv to artifacts
+          echo "Running prediction script (MODEL_SOURCE=$MODEL_SOURCE, PREFERRED_MODEL=$PREFERRED_MODEL, HOPSWORKS_MODEL_NAME=$HOPSWORKS_MODEL_NAME)..."
+          # Run predict.py; keep output in logs and move produced predictions.csv to artifacts
           python predict.py 2>&1 | tee logs/predict_output.txt || true
           if [ -f predictions.csv ]; then mv -f predictions.csv artifacts/ || true; fi
-          # Report which model files exist on runner (debug)
+          # Debug: print which RF-related files exist locally and show head of logs
           echo "Local models/ listing (for debug):"
           ls -la models || true
           echo "Predict logs head:"

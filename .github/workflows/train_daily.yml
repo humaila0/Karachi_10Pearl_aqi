@@ -1,8 +1,10 @@
 # Daily training workflow — retrain/evaluate and register model
-# Updated to avoid common runtime errors:
-# - Install a modern scikit-learn wheel so mean_squared_error(..., squared=False) is available
-# - Make Hopsworks diagnostic non-networking (check presence of secrets only)
-# - Robust training invocation that prefers repo-root train.py and prints debug listing
+# Full validated workflow with:
+# - correct YAML indentation (no tabs)
+# - robust file discovery and debug listing
+# - modern scikit-learn installed to avoid API mismatch errors
+# - non-networking HOPSWORKS secrets presence check (safe in CI)
+# - artifacts and logs uploaded for diagnostics
 
 on:
   schedule:
@@ -41,8 +43,7 @@ jobs:
           set -euo pipefail
           python -m pip install --upgrade pip wheel setuptools
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          # Ensure a modern scikit-learn is installed so runtime APIs (e.g. mean_squared_error(..., squared=False))
-          # are available. This avoids TypeError from older scikit-learn on the runner.
+          # Ensure a modern scikit-learn is available to avoid API mismatch errors in training/eval
           pip install --upgrade "scikit-learn>=1.0"
         shell: bash
 
@@ -72,8 +73,12 @@ jobs:
           sed -n '1,200p' .env | sed -e 's/=.*/=<REDACTED>/g'
         shell: bash
 
-      - name: Optional:HOPSWORKS secrets presence check (no network)
+      - name: "Optional: HOPSWORKS secrets presence check (no network)"
         # This avoids making network calls during CI. It only verifies that required secrets are present.
+        env:
+          HOPSWORKS_HOST_RAW: ${{ secrets.HOPSWORKS_HOST }}
+          HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
+          OPENWEATHER_API_KEY: ${{ secrets.OPENWEATHER_API_KEY }}
         run: |
           set -euo pipefail
           echo "HOPSWORKS_HOST set: ${HOPSWORKS_HOST_RAW:+yes}"
@@ -87,10 +92,6 @@ jobs:
           else
             echo "OPENWEATHER_API_KEY: present (redacted)"
           fi
-        env:
-          HOPSWORKS_HOST_RAW: ${{ secrets.HOPSWORKS_HOST }}
-          HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
-          OPENWEATHER_API_KEY: ${{ secrets.OPENWEATHER_API_KEY }}
         shell: bash
         continue-on-error: true
 

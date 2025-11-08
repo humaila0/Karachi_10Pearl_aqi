@@ -1,22 +1,18 @@
-# Daily training workflow — retrain/evaluate and register model
-# - Do NOT fetch Git LFS objects (avoids LFS quota failures)
-# - Uses Python 3.12 to match local environment
-# - Force-installs scikit-learn==1.2.2 (matches local)
-# - Attempts to download model artifacts from Hopsworks into models/
+# Hourly feature ingest + prediction — fetch model from Hopsworks (no Git LFS)
 on:
   schedule:
-    - cron: '0 2 * * *'  # Daily at 02:00 UTC
+    - cron: '0 * * * *'   # hourly
   workflow_dispatch:
 
 concurrency:
-  group: daily-train
+  group: hourly-ingest-predict
   cancel-in-progress: true
 
 jobs:
-  train:
+  ingest_and_predict:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository (skip LFS fetch to avoid quota errors)
+      - name: Checkout repository (do not fetch Git LFS objects)
         uses: actions/checkout@v4
         with:
           lfs: false
@@ -25,75 +21,51 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.12'
+          python-version: '3.12.7'
 
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}-sklearn-1.2.2
-          restore-keys: |
-            ${{ runner.os }}-pip-
-
-      - name: Install dependencies (force scikit-learn 1.2.2)
+      - name: Install system deps & Python packages
         run: |
-          set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y librdkafka-dev build-essential || true
           python -m pip install --upgrade pip setuptools wheel
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          python -m pip install --force-reinstall --no-cache-dir "scikit-learn==1.2.2"
+          python -m pip install python-dotenv hopsworks joblib || true
         shell: bash
 
-      - name: Show Python and scikit-learn versions (debug)
+      - name: Prepare .env from repository secret 'AQI'
         run: |
-          python -V
-          python -c "import sys; print('sys.executable:', sys.executable)"
-          python -c "import sklearn; print('sklearn.__version__ =', sklearn.__version__)"
-          pip show scikit-learn || true
-          pip freeze | grep scikit-learn || true
+          printf "%s\n" "${{ secrets.AQI }}" > .env
+          echo "Wrote .env from secrets.AQI (values kept hidden)"
         shell: bash
 
-      - name: Prepare .env from secrets (sanitized)
-        env:
-          HOPSWORKS_HOST_RAW: ${{ secrets.HOPSWORKS_HOST }}
-          HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
-          HOPSWORKS_PROJECT_ID: ${{ secrets.HOPSWORKS_PROJECT_ID }}
-          HOPSWORKS_FEATURE_GROUP: ${{ secrets.HOPSWORKS_FEATURE_GROUP }}
-          HOPSWORKS_FEATURE_GROUP_VERSION: ${{ secrets.HOPSWORKS_FEATURE_GROUP_VERSION }}
-          OPENWEATHER_API_KEY: ${{ secrets.OPENWEATHER_API_KEY }}
+      - name: Run feature pipeline (fetch & ingest)
+        id: pipeline
         run: |
           set -euo pipefail
-          HOST_SANITIZED="$(printf '%s' "$HOPSWORKS_HOST_RAW" | sed -e 's~https\?://~~I' -e 's:/*$::')"
-          : > .env
-          printf "HOPSWORKS_HOST=%s\n" "$HOST_SANITIZED" >> .env
-          printf "HOPSWORKS_API_KEY=%s\n" "$HOPSWORKS_API_KEY" >> .env
-          printf "HOPSWORKS_PROJECT_ID=%s\n" "$HOPSWORKS_PROJECT_ID" >> .env
-          printf "HOPSWORKS_FEATURE_GROUP=%s\n" "$HOPSWORKS_FEATURE_GROUP" >> .env
-          printf "HOPSWORKS_FEATURE_GROUP_VERSION=%s\n" "$HOPSWORKS_FEATURE_GROUP_VERSION" >> .env
-          printf "OPENWEATHER_API_KEY=%s\n" "$OPENWEATHER_API_KEY" >> .env
-          echo ".env preview (keys only):"
-          sed -n '1,200p' .env | sed -e 's/=.*/=<REDACTED>/g'
+          mkdir -p logs
+          echo "Running feature pipeline..."
+          python run_feature_pipeline.py 2>&1 | tee logs/run_feature_pipeline.log
         shell: bash
 
-      - name: "Optional: HOPSWORKS secrets presence check (no network)"
-        env:
-          HOPSWORKS_HOST_RAW: ${{ secrets.HOPSWORKS_HOST }}
-          HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
-          OPENWEATHER_API_KEY: ${{ secrets.OPENWEATHER_API_KEY }}
+      - name: Debug:confirm features/history timestamps
         run: |
-          set -euo pipefail
-          echo "HOPSWORKS_HOST set: ${HOPSWORKS_HOST_RAW:+yes}"
-          if [ -z "${HOPSWORKS_API_KEY:-}" ]; then
-            echo "HOPSWORKS_API_KEY: NOT SET"
-          else
-            echo "HOPSWORKS_API_KEY: present (redacted)"
-          fi
-          if [ -z "${OPENWEATHER_API_KEY:-}" ]; then
-            echo "OPENWEATHER_API_KEY: NOT SET"
-          else
-            echo "OPENWEATHER_API_KEY: present (redacted)"
-          fi
+          python - <<'PY'
+import os, pandas as pd
+from datetime import datetime,timezone
+print("now_utc:", datetime.now(timezone.utc))
+for p in ("features_with_standard_aqi.csv","features_preprocessed.csv","history.csv"):
+    if os.path.exists(p):
+        try:
+            df = pd.read_csv(p, parse_dates=["time"])
+            df['time'] = pd.to_datetime(df['time'], utc=True)
+            print(f"{p}: rows={len(df)} first={df['time'].min()} last={df['time'].max()}")
+            print(df.tail(3).to_string(index=False))
+        except Exception as e:
+            print("Failed to read",p,":",e)
+    else:
+        print("Missing:", p)
+PY
         shell: bash
-        continue-on-error: true
 
       - name: Download model artifacts from Hopsworks (best-effort)
         if: always()
@@ -101,60 +73,65 @@ jobs:
           HOPSWORKS_HOST: ${{ secrets.HOPSWORKS_HOST }}
           HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
           HOPSWORKS_PROJECT_ID: ${{ secrets.HOPSWORKS_PROJECT_ID }}
+          # Optional override; set this secret to your exact model name (recommended)
           HOPSWORKS_MODEL_NAME: ${{ secrets.HOPSWORKS_MODEL_NAME }}
           HOPSWORKS_MODEL_VERSION: ${{ secrets.HOPSWORKS_MODEL_VERSION }}
         run: |
           set -euo pipefail
-          echo "Attempting to download model artifacts from Hopsworks (if available)..."
-          python -m pip install --upgrade pip
-          python -m pip install hopsworks joblib || true
+          echo "Attempting Hopsworks model download..."
           python - <<'PY'
-from pathlib import Path
 import os, glob, shutil, sys
+from pathlib import Path
 try:
     import hopsworks
 except Exception as e:
-    print("hopsworks SDK not available or failed to import:", e, file=sys.stderr)
+    print("hopsworks import failed:", e, file=sys.stderr)
     sys.exit(0)
 
-model_name = os.getenv("HOPSWORKS_MODEL_NAME", f"aqi_rf_{os.getenv('TARGET','standard_aqi_next_24h')}")
+model_name = os.getenv("HOPSWORKS_MODEL_NAME", "aqi_rf_standard_aqi_next_24h_20251030T153032Z")
 model_version = os.getenv("HOPSWORKS_MODEL_VERSION", "")
 
-print("Logging into Hopsworks (skips on failure)...")
 try:
     project = hopsworks.login()
     mr = project.get_model_registry()
 except Exception as e:
-    print("Hopsworks login/get_model_registry failed, skipping download:", e)
+    print("hopsworks login/get_model_registry failed:", e, file=sys.stderr)
     sys.exit(0)
 
 entry = None
+# 1) try exact provided name+version
 try:
-    if model_version:
+    if model_name and model_version:
         try:
             entry = mr.get_model(model_name, version=int(model_version))
         except Exception:
             entry = None
-    if entry is None:
+    if entry is None and model_name:
         try:
             models = mr.get_models(name=model_name)
             if models:
                 entry = models[0]
         except Exception:
             entry = None
+    # 2) fallback: find an RF model by name heuristic if none found
+    if entry is None:
+        for m in mr.get_models():
+            if m and m.name and "aqi_rf" in m.name:
+                entry = m
+                break
 except Exception as e:
-    print("Error while locating model in registry:", e)
+    print("model lookup failed:", e, file=sys.stderr)
     entry = None
 
 if entry is None:
-    print("No model entry found for", model_name, "- skipping artifact download.")
+    print("No model entry found; skipping download.")
     sys.exit(0)
 
-print("Downloading model entry:", model_name)
+print("Downloading model entry:", entry.name)
 try:
     folder = entry.download()
 except Exception as e:
-    print("Model download failed:", e)
+    print("download failed:", e, file=sys.stderr)
     sys.exit(0)
 
 dst = Path("models")
@@ -162,56 +139,54 @@ dst.mkdir(parents=True, exist_ok=True)
 copied = 0
 for p in glob.glob(str(Path(folder) / "**" / "*.pkl"), recursive=True):
     shutil.copy(p, dst)
-    print("Copied", p, "->", dst)
+    print("copied", p)
     copied += 1
-if copied == 0:
-    print("No .pkl artifacts found in downloaded model folder; registry entry may contain different files.")
-else:
-    print(f"Copied {copied} artifact(s) to {dst}")
+print("copied files:", copied)
 PY
         shell: bash
 
-      - name: Run training
-        id: train
+      - name: Ensure no stale predictions.csv & inspect models (debug)
         run: |
-          set -euo pipefail
-          mkdir -p logs artifacts
-          echo "Running training script..."
-          echo "Working directory:"; pwd
-          echo "Top-level files:"; ls -la
-          echo "Contents of models/ (if exists):"; ls -la models || true
-          echo
-          if [ -f "train.py" ]; then
-            echo "Found train.py at repository root — running python train.py"
-            python train.py 2>&1 | tee logs/train.log
-          else
-            echo "ERROR: train.py not found; aborting."
-            exit 2
-          fi
+          # avoid silently re-using old predictions.csv
+          rm -f predictions.csv || true
+          echo "models/ listing (size):"
+          ls -lh models || true
+          echo "If any model file exists, show first 64 bytes hexdump to confirm binary pickle (not a pointer):"
+          for f in models/*.pkl models/*.joblib 2>/dev/null; do
+            echo "---- $f ----"
+            head -c 64 "$f" | hexdump -C -n 64 || head -c 64 "$f" | xxd || true
+            stat -c "%n size=%s" "$f" || true
+          done
         shell: bash
 
-      - name: Upload training logs & artifacts
-        if: always()
+      - name: Run predictions (force RandomForest from Hopsworks)
+        id: predict
+        continue-on-error: true
+        env:
+          MODEL_SOURCE: "hopsworks"
+          PREFERRED_MODEL: "rf"
+          HOPSWORKS_MODEL_NAME: ${{ secrets.HOPSWORKS_MODEL_NAME }}
+          HOPSWORKS_HOST: ${{ secrets.HOPSWORKS_HOST }}
+          HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
+          HOPSWORKS_PROJECT_ID: ${{ secrets.HOPSWORKS_PROJECT_ID }}
+          HOPSWORKS_FEATURE_GROUP: ${{ secrets.HOPSWORKS_FEATURE_GROUP }}
+          HOPSWORKS_FEATURE_GROUP_VERSION: ${{ secrets.HOPSWORKS_FEATURE_GROUP_VERSION }}
+          OPENWEATHER_API_KEY: ${{ secrets.OPENWEATHER_API_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p logs artifacts predictions
+          echo "Running prediction script..."
+          python predict.py 2>&1 | tee logs/predict_output.txt || true
+          if [ -f predictions.csv ]; then mv -f predictions.csv artifacts/ || true; fi
+          echo "predict log head:"
+          head -n 200 logs/predict_output.txt || true
+        shell: bash
+
+      - name: Upload logs & artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: daily-train-artifacts
+          name: hourly-ingest-predict-artifacts
           path: |
             logs
             artifacts
-
-      - name: Post Cache pip
-        if: always()
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}-sklearn-1.2.2
-          restore-keys: |
-            ${{ runner.os }}-pip-
-
-      - name: Post Set up Python
-        if: always()
-        run: echo "Done."
-
-      - name: Post Checkout repository
-        if: always()
-        run: echo "Done."
+            predictions

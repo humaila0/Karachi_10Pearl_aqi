@@ -1,139 +1,103 @@
-# Daily training workflow — retrain/evaluate and register model
-# - Uses Python 3.12 (match local)
-# - Force-reinstalls scikit-learn==1.2.2
-# - DOES NOT fetch Git LFS objects (avoids LFS quota failures)
-on:
-  schedule:
-    - cron: '0 2 * * *'
-  workflow_dispatch:
-
-concurrency:
-  group: daily-train
-  cancel-in-progress: true
-
-jobs:
-  train:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository (skip LFS fetch to avoid quota errors)
-        uses: actions/checkout@v4
-        with:
-          lfs: false         # IMPORTANT: do not fetch LFS objects (avoids LFS quota failure)
-          fetch-depth: 0
-
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.12'
-
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}-sklearn-1.2.2
-          restore-keys: |
-            ${{ runner.os }}-pip-
-
-      - name: Install dependencies (force scikit-learn 1.2.2)
-        run: |
-          set -euo pipefail
-          python -m pip install --upgrade pip setuptools wheel
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          python -m pip install --force-reinstall --no-cache-dir "scikit-learn==1.2.2"
-        shell: bash
-
-      - name: Show Python and scikit-learn versions (debug)
-        run: |
-          python -V
-          python -c "import sys; print('sys.executable:', sys.executable)"
-          python -c "import sklearn; print('sklearn.__version__ =', sklearn.__version__)"
-          pip show scikit-learn || true
-        shell: bash
-
-      - name: Prepare .env from secrets (sanitized)
-        env:
-          HOPSWORKS_HOST_RAW: ${{ secrets.HOPSWORKS_HOST }}
-          HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
-          HOPSWORKS_PROJECT_ID: ${{ secrets.HOPSWORKS_PROJECT_ID }}
-          HOPSWORKS_FEATURE_GROUP: ${{ secrets.HOPSWORKS_FEATURE_GROUP }}
-          HOPSWORKS_FEATURE_GROUP_VERSION: ${{ secrets.HOPSWORKS_FEATURE_GROUP_VERSION }}
-          OPENWEATHER_API_KEY: ${{ secrets.OPENWEATHER_API_KEY }}
-        run: |
-          set -euo pipefail
-          HOST_SANITIZED="$(printf '%s' "$HOPSWORKS_HOST_RAW" | sed -e 's~https\?://~~I' -e 's:/*$::')"
-          : > .env
-          printf "HOPSWORKS_HOST=%s\n" "$HOST_SANITIZED" >> .env
-          printf "HOPSWORKS_API_KEY=%s\n" "$HOPSWORKS_API_KEY" >> .env
-          printf "HOPSWORKS_PROJECT_ID=%s\n" "$HOPSWORKS_PROJECT_ID" >> .env
-          printf "HOPSWORKS_FEATURE_GROUP=%s\n" "$HOPSWORKS_FEATURE_GROUP" >> .env
-          printf "HOPSWORKS_FEATURE_GROUP_VERSION=%s\n" "$HOPSWORKS_FEATURE_GROUP_VERSION" >> .env
-          printf "OPENWEATHER_API_KEY=%s\n" "$OPENWEATHER_API_KEY" >> .env
-          echo ".env preview (keys only):"
-          sed -n '1,200p' .env | sed -e 's/=.*/=<REDACTED>/g'
-        shell: bash
-
-      - name: "Optional: HOPSWORKS secrets presence check (no network)"
-        env:
-          HOPSWORKS_HOST_RAW: ${{ secrets.HOPSWORKS_HOST }}
-          HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
-          OPENWEATHER_API_KEY: ${{ secrets.OPENWEATHER_API_KEY }}
-        run: |
-          set -euo pipefail
-          echo "HOPSWORKS_HOST set: ${HOPSWORKS_HOST_RAW:+yes}"
-          if [ -z "${HOPSWORKS_API_KEY:-}" ]; then
-            echo "HOPSWORKS_API_KEY: NOT SET"
-          else
-            echo "HOPSWORKS_API_KEY: present (redacted)"
-          fi
-          if [ -z "${OPENWEATHER_API_KEY:-}" ]; then
-            echo "OPENWEATHER_API_KEY: NOT SET"
-          else
-            echo "OPENWEATHER_API_KEY: present (redacted)"
-          fi
-        shell: bash
-        continue-on-error: true
-
-      - name: Run training
-        id: train
-        run: |
-          set -euo pipefail
-          mkdir -p logs artifacts
-          echo "Running training script..."
-          echo "Working directory:"; pwd
-          echo "Top-level files:"; ls -la
-          echo "Contents of models/ (if exists):"; ls -la models || true
-          echo
-          if [ -f "train.py" ]; then
-            echo "Found train.py at repository root — running python train.py"
-            python train.py 2>&1 | tee logs/train.log
-          else
-            echo "ERROR: train.py not found; aborting."
-            exit 2
-          fi
-        shell: bash
-
-      - name: Upload training logs & artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: daily-train-artifacts
-          path: |
-            logs
-            artifacts
-
-      - name: Post Cache pip
-        if: always()
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}-sklearn-1.2.2
-          restore-keys: |
-            ${{ runner.os }}-pip-
-
-      - name: Post Set up Python
-        if: always()
-        run: echo "Done."
-
-      - name: Post Checkout repository
-        if: always()
-        run: echo "Done."
+*** Begin Patch
+*** Update File: .github/workflows/train_daily.yml
+@@
+-      - name: Checkout repository
+-        uses: actions/checkout@v4
+-        with:
+-          lfs: true
+-          fetch-depth: 0
++      - name: Checkout repository
++        uses: actions/checkout@v4
++        with:
++          lfs: false        # do not fetch Git LFS objects (avoids LFS quota failures)
++          fetch-depth: 0
+@@
+       - name: Install dependencies (incl. compatible scikit-learn)
+         run: |
+           set -euo pipefail
+           python -m pip install --upgrade pip wheel setuptools
+           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+           # Ensure a modern scikit-learn is available to avoid API mismatch errors in training/eval
+-          pip install --upgrade "scikit-learn>=1.0"
++          # force a known compatible version to avoid runtime API mismatches
++          python -m pip install --force-reinstall --no-cache-dir "scikit-learn==1.2.2"
+         shell: bash
++
++      - name: Download model artifacts from Hopsworks (optional)
++        if: always()
++        env:
++          HOPSWORKS_HOST: ${{ secrets.HOPSWORKS_HOST }}
++          HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
++          HOPSWORKS_PROJECT_ID: ${{ secrets.HOPSWORKS_PROJECT_ID }}
++          # Optionally set model name/version in repository secrets or leave defaults below
++          HOPSWORKS_MODEL_NAME: ${{ secrets.HOPSWORKS_MODEL_NAME }}
++          HOPSWORKS_MODEL_VERSION: ${{ secrets.HOPSWORKS_MODEL_VERSION }}
++        run: |
++          set -euo pipefail
++          echo "Attempting to download model artifacts from Hopsworks (if available)..."
++          python -m pip install --upgrade pip
++          python -m pip install hopsworks joblib || true
++          python - <<'PY'
++from pathlib import Path
++import os, glob, shutil, sys
++try:
++    import hopsworks
++except Exception as e:
++    print("hopsworks SDK not available or failed to import:", e, file=sys.stderr)
++    sys.exit(0)
++
++model_name = os.getenv("HOPSWORKS_MODEL_NAME", f"aqi_rf_{os.getenv('TARGET','standard_aqi_next_24h')}")
++model_version = os.getenv("HOPSWORKS_MODEL_VERSION", "")
++
++print("Logging into Hopsworks (no network errors will abort)...")
++try:
++    project = hopsworks.login()
++    mr = project.get_model_registry()
++except Exception as e:
++    print("Hopsworks login/get_model_registry failed, skipping download:", e)
++    sys.exit(0)
++
++entry = None
++try:
++    if model_version:
++        try:
++            entry = mr.get_model(model_name, version=int(model_version))
++        except Exception:
++            entry = None
++    if entry is None:
++        try:
++            # try to fetch latest by name
++            models = mr.get_models(name=model_name)
++            if models:
++                entry = models[0]
++        except Exception:
++            entry = None
++except Exception as e:
++    print("Error while locating model in registry:", e)
++    entry = None
++
++if entry is None:
++    print("No model entry found for", model_name, "- skipping artifact download.")
++    sys.exit(0)
++
++print("Downloading model entry:", model_name)
++try:
++    folder = entry.download()
++except Exception as e:
++    print("Model download failed:", e)
++    sys.exit(0)
++
++dst = Path("models")
++dst.mkdir(parents=True, exist_ok=True)
++copied = 0
++for p in glob.glob(str(Path(folder) / "**" / "*.pkl"), recursive=True):
++    shutil.copy(p, dst)
++    print("Copied", p, "->", dst)
++    copied += 1
++if copied == 0:
++    print("No .pkl artifacts found in downloaded model folder; registry entry may contain different files.")
++else:
++    print(f"Copied {copied} artifact(s) to {dst}")
++PY
++        shell: bash
+*** End Patch

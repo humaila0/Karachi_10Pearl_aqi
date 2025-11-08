@@ -1,15 +1,11 @@
 # Hourly feature ingest + prediction (force use of RandomForest from Hopsworks)
-# This workflow avoids fetching Git LFS objects and attempts to download model artifacts
-# from Hopsworks at runtime (best-effort) so CI does not rely on LFS storage.
 on:
   schedule:
     - cron: '0 * * * *'   # At the top of every hour (UTC)
   workflow_dispatch:     # Allow manual runs from the Actions UI
-
 concurrency:
   group: hourly-ingest-predict
   cancel-in-progress: true
-
 jobs:
   ingest_and_predict:
     name: Ingest features and produce predictions (RF only)
@@ -20,12 +16,10 @@ jobs:
         with:
           lfs: false  # ✅ DISABLED - Not needed since we use Hopsworks
           fetch-depth: 0
-
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.12.7'
-
       - name: Cache pip
         uses: actions/cache@v4
         with:
@@ -33,22 +27,19 @@ jobs:
           key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
           restore-keys: |
             ${{ runner.os }}-pip-
-
       - name: Install dependencies (including system libs for confluent-kafka)
         run: |
           sudo apt-get update -y
           sudo apt-get install -y librdkafka-dev build-essential || true
           python -m pip install --upgrade pip setuptools wheel
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          pip install python-dotenv hopsworks joblib || true
+          pip install python-dotenv
         shell: bash
-
       - name: Prepare .env from repository secret 'AQI'
         run: |
           printf "%s\n" "${{ secrets.AQI }}" > .env
           echo "Wrote .env from secrets.AQI (values kept hidden)"
         shell: bash
-
       - name: Run feature pipeline (fetch & ingest)
         id: pipeline
         run: |
@@ -57,93 +48,6 @@ jobs:
           echo "Running feature pipeline..."
           python run_feature_pipeline.py 2>&1 | tee logs/run_feature_pipeline.log
         shell: bash
-
-      - name: Download model artifacts from Hopsworks (best-effort)
-        if: always()
-        env:
-          HOPSWORKS_HOST: ${{ secrets.HOPSWORKS_HOST }}
-          HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
-          HOPSWORKS_PROJECT_ID: ${{ secrets.HOPSWORKS_PROJECT_ID }}
-          # Optional: override these secrets if you want a specific model/version
-          HOPSWORKS_MODEL_NAME: ${{ secrets.HOPSWORKS_MODEL_NAME }}
-          HOPSWORKS_MODEL_VERSION: ${{ secrets.HOPSWORKS_MODEL_VERSION }}
-        run: |
-          set -euo pipefail
-          echo "Attempting to download model artifacts from Hopsworks (if available)..."
-          # hopsworks and joblib already attempted to install above, but ensure importable
-          python - <<'PY'
-import os, glob, shutil, sys
-from pathlib import Path
-try:
-    import hopsworks
-except Exception as e:
-    print("hopsworks SDK not available or failed to import:", e, file=sys.stderr)
-    sys.exit(0)
-
-model_name = os.getenv("HOPSWORKS_MODEL_NAME", "")
-model_version = os.getenv("HOPSWORKS_MODEL_VERSION", "")
-
-print("Logging into Hopsworks (skips on failure)...")
-try:
-    project = hopsworks.login()
-    mr = project.get_model_registry()
-except Exception as e:
-    print("Hopsworks login/get_model_registry failed, skipping download:", e)
-    sys.exit(0)
-
-entry = None
-try:
-    if model_name and model_version:
-        try:
-            entry = mr.get_model(model_name, version=int(model_version))
-        except Exception:
-            entry = None
-    if entry is None and model_name:
-        try:
-            models = mr.get_models(name=model_name)
-            if models:
-                entry = models[0]
-        except Exception:
-            entry = None
-    if entry is None:
-        # If no explicit model name provided, attempt to find a likely RF model by prefix
-        try:
-            all_models = mr.get_models()
-            for m in all_models:
-                if "aqi_rf" in (m.name or ""):
-                    entry = m
-                    break
-        except Exception:
-            pass
-except Exception as e:
-    print("Error while locating model in registry:", e)
-    entry = None
-
-if entry is None:
-    print("No model entry found for", model_name or "(auto)", "- skipping artifact download.")
-    sys.exit(0)
-
-print("Downloading model entry:", entry.name)
-try:
-    folder = entry.download()
-except Exception as e:
-    print("Model download failed:", e)
-    sys.exit(0)
-
-dst = Path("models")
-dst.mkdir(parents=True, exist_ok=True)
-copied = 0
-for p in glob.glob(str(Path(folder) / "**" / "*.pkl"), recursive=True):
-    shutil.copy(p, dst)
-    print("Copied", p, "->", dst)
-    copied += 1
-if copied == 0:
-    print("No .pkl artifacts found in downloaded model folder; registry entry may contain different files.")
-else:
-    print(f"Copied {copied} artifact(s) to {dst}")
-PY
-        shell: bash
-
       - name: Run predictions (force RandomForest from Hopsworks)
         id: predict
         continue-on-error: true
@@ -151,8 +55,8 @@ PY
           # Force model selection policy: always try Hopsworks and use the RF model
           MODEL_SOURCE: "hopsworks"
           PREFERRED_MODEL: "rf"
-          # Use the exact RF model name you uploaded to Hopsworks (update secret if different)
-          HOPSWORKS_MODEL_NAME: ${{ secrets.HOPSWORKS_MODEL_NAME }}
+          # Use the exact RF model name you uploaded to Hopsworks (update if different)
+          HOPSWORKS_MODEL_NAME: "aqi_rf_standard_aqi_next_24h_20251030T153032Z"
           # Hopsworks / OpenWeather secrets (map from Actions secrets). Optional if .env already contains them.
           HOPSWORKS_HOST: ${{ secrets.HOPSWORKS_HOST }}
           HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
@@ -163,7 +67,7 @@ PY
         run: |
           set -euo pipefail
           mkdir -p artifacts predictions logs
-          echo "Running prediction script (MODEL_SOURCE=$MODEL_SOURCE, PREFERRED_MODEL=$PREFERRED_MODEL, HOPSWORKS_MODEL_NAME=${HOPSWORKS_MODEL_NAME:-})..."
+          echo "Running prediction script (MODEL_SOURCE=$MODEL_SOURCE, PREFERRED_MODEL=$PREFERRED_MODEL, HOPSWORKS_MODEL_NAME=$HOPSWORKS_MODEL_NAME)..."
           # Run predict.py; keep output in logs and move produced predictions.csv to artifacts
           python predict.py 2>&1 | tee logs/predict_output.txt || true
           if [ -f predictions.csv ]; then mv -f predictions.csv artifacts/ || true; fi
@@ -173,7 +77,6 @@ PY
           echo "Predict logs head:"
           head -n 200 logs/predict_output.txt || true
         shell: bash
-
       - name: Upload logs & artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -181,4 +84,4 @@ PY
           path: |
             logs
             artifacts
-            predictions
+            predictions || true

@@ -1,10 +1,8 @@
 # Daily training workflow — retrain/evaluate and register model
-# Full validated workflow with:
-# - correct YAML indentation (no tabs)
-# - robust file discovery and debug listing
-# - modern scikit-learn installed to avoid API mismatch errors
-# - non-networking HOPSWORKS secrets presence check (safe in CI)
-# - artifacts and logs uploaded for diagnostics
+# - Uses Python 3.12 to match local env (you reported 3.12.7)
+# - Force-reinstalls scikit-learn==1.2.2 (matches your local version)
+# - Prints Python/sklearn versions for debugging
+# - Uploads logs/artifacts for inspection
 
 on:
   schedule:
@@ -28,23 +26,33 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.10'
+          python-version: '3.12'    # match your local Python 3.12.7
 
       - name: Cache pip
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          # include sklearn version in cache key so changes invalidate cache
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}-sklearn-1.2.2
           restore-keys: |
             ${{ runner.os }}-pip-
 
-      - name: Install dependencies (incl. compatible scikit-learn)
+      - name: Install dependencies (force scikit-learn 1.2.2)
         run: |
           set -euo pipefail
-          python -m pip install --upgrade pip wheel setuptools
+          python -m pip install --upgrade pip setuptools wheel
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          # Ensure a modern scikit-learn is available to avoid API mismatch errors in training/eval
-          pip install --upgrade "scikit-learn>=1.0"
+          # Force reinstall scikit-learn to ensure runner uses the pinned version
+          python -m pip install --force-reinstall --no-cache-dir "scikit-learn==1.2.2"
+        shell: bash
+
+      - name: Show Python and scikit-learn versions (debug)
+        run: |
+          python -V
+          python -c "import sys; print('sys.executable:', sys.executable)"
+          python -c "import sklearn; print('sklearn.__version__ =', sklearn.__version__)"
+          pip show scikit-learn || true
+          pip freeze | grep scikit-learn || true
         shell: bash
 
       - name: Prepare .env from secrets (sanitized)
@@ -59,7 +67,6 @@ jobs:
           set -euo pipefail
           # sanitize host (strip http(s) scheme and trailing slashes)
           HOST_SANITIZED="$(printf '%s' "$HOPSWORKS_HOST_RAW" | sed -e 's~https\?://~~I' -e 's:/*$::')"
-
           : > .env
           printf "HOPSWORKS_HOST=%s\n" "$HOST_SANITIZED" >> .env
           printf "HOPSWORKS_API_KEY=%s\n" "$HOPSWORKS_API_KEY" >> .env
@@ -67,14 +74,12 @@ jobs:
           printf "HOPSWORKS_FEATURE_GROUP=%s\n" "$HOPSWORKS_FEATURE_GROUP" >> .env
           printf "HOPSWORKS_FEATURE_GROUP_VERSION=%s\n" "$HOPSWORKS_FEATURE_GROUP_VERSION" >> .env
           printf "OPENWEATHER_API_KEY=%s\n" "$OPENWEATHER_API_KEY" >> .env
-
           # show redacted preview for debugging (no secrets printed)
           echo ".env preview (keys only):"
           sed -n '1,200p' .env | sed -e 's/=.*/=<REDACTED>/g'
         shell: bash
 
       - name: "Optional: HOPSWORKS secrets presence check (no network)"
-        # This avoids making network calls during CI. It only verifies that required secrets are present.
         env:
           HOPSWORKS_HOST_RAW: ${{ secrets.HOPSWORKS_HOST }}
           HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
@@ -101,13 +106,11 @@ jobs:
           set -euo pipefail
           mkdir -p logs artifacts
           echo "Running training script..."
-          # Debug listing so we can see where files are on the runner
           echo "Working directory:"; pwd
           echo "Top-level files:"; ls -la
           echo "Contents of src/ (if exists):"; ls -la src || true
           echo "Contents of models/ (if exists):"; ls -la models || true
           echo
-          # Prefer repo root train.py (matches your repo); fallback to src/
           if [ -f "train.py" ]; then
             echo "Found train.py at repository root — running python train.py"
             python train.py 2>&1 | tee logs/train.log
@@ -135,7 +138,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}-sklearn-1.2.2
           restore-keys: |
             ${{ runner.os }}-pip-
 

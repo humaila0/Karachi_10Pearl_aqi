@@ -52,17 +52,16 @@ jobs:
       - name: Verify Python / numpy / pandas / sklearn (sanity check)
         run: |
           python - <<'PY'
-          import sys
-          import importlib
-          names = ("numpy", "pandas", "sklearn")
-          print("python", sys.version.splitlines()[0])
-          for n in names:
-              try:
-                  m = importlib.import_module(n)
-                  print(n, m.__version__)
-              except Exception as e:
-                  print(n, "import error:", e)
-          PY
+import sys, importlib
+names = ("numpy","pandas","sklearn")
+print("python", sys.version.splitlines()[0])
+for n in names:
+    try:
+        m = importlib.import_module(n)
+        print(n, m.__version__)
+    except Exception as e:
+        print(n, "import error:", e)
+PY
         shell: bash
 
       - name: Prepare .env from secrets (sanitized)
@@ -83,6 +82,7 @@ jobs:
           printf "HOPSWORKS_FEATURE_GROUP=%s\n" "$HOPSWORKS_FEATURE_GROUP" >> .env
           printf "HOPSWORKS_FEATURE_GROUP_VERSION=%s\n" "$HOPSWORKS_FEATURE_GROUP_VERSION" >> .env
           printf "OPENWEATHER_API_KEY=%s\n" "$OPENWEATHER_API_KEY" >> .env
+          # show redacted preview for debugging (no secrets printed)
           echo ".env preview (keys only):"
           sed -n '1,200p' .env | sed -e 's/=.*/=<REDACTED>/g'
         shell: bash
@@ -110,16 +110,29 @@ jobs:
 
       - name: Run training
         id: train
+        env:
+          # pass Hopsworks credentials into the training step so hopsworks.login() can connect
+          HOPSWORKS_HOST: ${{ secrets.HOPSWORKS_HOST }}
+          HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
+          HOPSWORKS_PROJECT_ID: ${{ secrets.HOPSWORKS_PROJECT_ID }}
+          HOPSWORKS_FEATURE_GROUP: ${{ secrets.HOPSWORKS_FEATURE_GROUP }}
+          HOPSWORKS_FEATURE_GROUP_VERSION: ${{ secrets.HOPSWORKS_FEATURE_GROUP_VERSION }}
+          OPENWEATHER_API_KEY: ${{ secrets.OPENWEATHER_API_KEY }}
         run: |
           set -euo pipefail
           mkdir -p logs artifacts
           echo "Running training script..."
+          # Show minimal presence checks (no secret values)
+          echo "HOPSWORKS_HOST present: ${HOPSWORKS_HOST:+yes}"
+          echo "HOPSWORKS_API_KEY present: ${HOPSWORKS_API_KEY:+yes}"
+          echo "HOPSWORKS_PROJECT_ID present: ${HOPSWORKS_PROJECT_ID:+yes}"
           if [ -f "train.py" ]; then
             python train.py 2>&1 | tee logs/train.log
           elif [ -f "src/train.py" ]; then
             python src/train.py 2>&1 | tee logs/train.log
           else
             echo "ERROR: train.py not found; aborting."
+            ls -R .
             exit 2
           fi
         shell: bash
@@ -145,19 +158,19 @@ jobs:
       - name: Debug:confirm features/history timestamps
         run: |
           python - <<'PY'
-          from datetime import datetime, timezone
-          import os, pandas as pd
-          print("now_utc:", datetime.now(timezone.utc))
-          for p in ("features_with_standard_aqi.csv","features_preprocessed.csv","history.csv"):
-              if os.path.exists(p):
-                  try:
-                      df = pd.read_csv(p, parse_dates=["time"])
-                      df['time'] = pd.to_datetime(df['time'], utc=True)
-                      print(f"{p}: rows={len(df)} first={df['time'].min()} last={df['time'].max()}")
-                      print(df.tail(3).to_string(index=False))
-                  except Exception as e:
-                      print("Failed to read",p,":",e)
-              else:
-                  print("Missing:", p)
-          PY
+from datetime import datetime, timezone
+import os, pandas as pd
+print("now_utc:", datetime.now(timezone.utc))
+for p in ("features_with_standard_aqi.csv","features_preprocessed.csv","history.csv"):
+    if os.path.exists(p):
+        try:
+            df = pd.read_csv(p, parse_dates=["time"])
+            df['time'] = pd.to_datetime(df['time'], utc=True)
+            print(f"{p}: rows={len(df)} first={df['time'].min()} last={df['time'].max()}")
+            print(df.tail(3).to_string(index=False))
+        except Exception as e:
+            print("Failed to read",p,":",e)
+    else:
+        print("Missing:", p)
+PY
         shell: bash

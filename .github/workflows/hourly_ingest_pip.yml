@@ -3,11 +3,9 @@ on:
   schedule:
     - cron: '0 * * * *'   # At the top of every hour (UTC)
   workflow_dispatch:     # Allow manual runs from the Actions UI
-
 concurrency:
   group: hourly-ingest-predict
   cancel-in-progress: true
-
 jobs:
   ingest_and_predict:
     name: Ingest features and produce predictions (RF only)
@@ -16,14 +14,12 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          lfs: false
+          lfs: false  # ✅ DISABLED - Not needed since we use Hopsworks
           fetch-depth: 0
-
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.12.7'
-
       - name: Cache pip
         uses: actions/cache@v4
         with:
@@ -31,7 +27,6 @@ jobs:
           key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
           restore-keys: |
             ${{ runner.os }}-pip-
-
       - name: Install dependencies (including system libs for confluent-kafka)
         run: |
           sudo apt-get update -y
@@ -40,13 +35,11 @@ jobs:
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
           pip install python-dotenv
         shell: bash
-
       - name: Prepare .env from repository secret 'AQI'
         run: |
           printf "%s\n" "${{ secrets.AQI }}" > .env
           echo "Wrote .env from secrets.AQI (values kept hidden)"
         shell: bash
-
       - name: Run feature pipeline (fetch & ingest)
         id: pipeline
         run: |
@@ -55,7 +48,6 @@ jobs:
           echo "Running feature pipeline..."
           python run_feature_pipeline.py 2>&1 | tee logs/run_feature_pipeline.log
         shell: bash
-
       - name: Run predictions (force RandomForest from Hopsworks)
         id: predict
         continue-on-error: true
@@ -85,7 +77,6 @@ jobs:
           echo "Predict logs head:"
           head -n 200 logs/predict_output.txt || true
         shell: bash
-
       - name: Upload logs & artifacts
         uses: actions/upload-artifact@v4
         with:

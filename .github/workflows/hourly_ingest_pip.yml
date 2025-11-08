@@ -148,15 +148,35 @@ jobs:
 
       - name: Ensure no stale predictions.csv & inspect models (debug)
         run: |
+          # remove any old predictions so we don't reuse stale output
           rm -f predictions.csv || true
+
           echo "models/ listing (size):"
           ls -lh models || true
+
           echo "Show first bytes of any model files to confirm binary pickle (not a pointer):"
-          for f in models/*.pkl models/*.joblib 2>/dev/null; do
-            echo "---- $f ----"
-            head -c 64 "$f" | hexdump -C -n 64 || head -c 64 "$f" | xxd || true
-            stat -c "%n size=%s" "$f" || true
-          done
+          # glob may expand to literal patterns if no files exist; handle that safely
+          shopt -s nullglob || true
+          files=(models/*.pkl models/*.joblib)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No model files found in models/."
+          else
+            for f in "${files[@]}"; do
+              if [ ! -f "$f" ]; then
+                continue
+              fi
+              echo "---- $f ----"
+              # print a hexdump (64 bytes) of the start of the file; try hexdump then xxd then head fallback
+              if command -v hexdump >/dev/null 2>&1; then
+                head -c 64 "$f" | hexdump -C -n 64 || true
+              elif command -v xxd >/dev/null 2>&1; then
+                head -c 64 "$f" | xxd || true
+              else
+                head -c 64 "$f" | sed -n '1,10p' || true
+              fi
+              stat -c "%n size=%s" "$f" || true
+            done
+          fi
         shell: bash
 
       - name: Run predictions (force RandomForest from Hopsworks)

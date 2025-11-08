@@ -1,7 +1,10 @@
 # Daily training workflow — retrain/evaluate and register model
+# - Do NOT fetch Git LFS objects (avoids LFS quota failures)
+# - Uses Python 3.12 to match local environment
+# - Installs numpy pinned to 1.26.4 then scikit-learn==1.2.2 to avoid ABI mismatch
 on:
   schedule:
-    - cron: '0 2 * * *'
+    - cron: '0 2 * * *'  # Daily at 02:00 UTC
   workflow_dispatch:
 
 concurrency:
@@ -35,27 +38,35 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip setuptools wheel
+          # 1) Pin numpy to the <2.x release that matches pandas 2.1.4 locally
           python -m pip install --no-cache-dir --prefer-binary "numpy==1.26.4"
+          # 2) Install other requirements without touching numpy or scikit-learn
           if [ -f requirements.txt ]; then
             sed '/^[[:space:]]*numpy/Id; /^[[:space:]]*scikit-learn/Id' requirements.txt > /tmp/reqs_no_np_skl.txt || true
             pip install --no-cache-dir -r /tmp/reqs_no_np_skl.txt || true
           fi
+          # 3) Finally install the scikit-learn version you use locally
           python -m pip install --no-cache-dir --prefer-binary "scikit-learn==1.2.2"
         shell: bash
 
       - name: Verify Python / numpy / pandas / sklearn (sanity check)
         run: |
+          # Use textwrap.dedent so YAML indentation won't cause a Python IndentationError
           python - <<'PY'
-            import sys
-            import importlib
-            names = ("numpy", "pandas", "sklearn")
-            print("python", sys.version.splitlines()[0])
-            for n in names:
-                try:
-                    m = importlib.import_module(n)
-                    print(n, m.__version__)
-                except Exception as e:
-                    print(n, "import error:", e)
+          import textwrap, sys, importlib
+          code = """
+          import sys
+          import importlib
+          names = ("numpy", "pandas", "sklearn")
+          print("python", sys.version.splitlines()[0])
+          for n in names:
+              try:
+                  m = importlib.import_module(n)
+                  print(n, m.__version__)
+              except Exception as e:
+                  print(n, "import error:", e)
+          """
+          exec(textwrap.dedent(code))
           PY
         shell: bash
 
@@ -77,13 +88,36 @@ jobs:
           printf "HOPSWORKS_FEATURE_GROUP=%s\n" "$HOPSWORKS_FEATURE_GROUP" >> .env
           printf "HOPSWORKS_FEATURE_GROUP_VERSION=%s\n" "$HOPSWORKS_FEATURE_GROUP_VERSION" >> .env
           printf "OPENWEATHER_API_KEY=%s\n" "$OPENWEATHER_API_KEY" >> .env
+          # show redacted preview for debugging (no secrets printed)
           echo ".env preview (keys only):"
           sed -n '1,200p' .env | sed -e 's/=.*/=<REDACTED>/g'
         shell: bash
 
+      - name: "Optional: HOPSWORKS secrets presence check (no network)"
+        env:
+          HOPSWORKS_HOST_RAW: ${{ secrets.HOPSWORKS_HOST }}
+          HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
+          OPENWEATHER_API_KEY: ${{ secrets.OPENWEATHER_API_KEY }}
+        run: |
+          set -euo pipefail
+          echo "HOPSWORKS_HOST set: ${HOPSWORKS_HOST_RAW:+yes}"
+          if [ -z "${HOPSWORKS_API_KEY:-}" ]; then
+            echo "HOPSWORKS_API_KEY: NOT SET"
+          else
+            echo "HOPSWORKS_API_KEY: present (redacted)"
+          fi
+          if [ -z "${OPENWEATHER_API_KEY:-}" ]; then
+            echo "OPENWEATHER_API_KEY: NOT SET"
+          else
+            echo "OPENWEATHER_API_KEY: present (redacted)"
+          fi
+        shell: bash
+        continue-on-error: true
+
       - name: Run training
         id: train
         env:
+          # pass Hopsworks credentials into the training step so hopsworks.login() can connect
           HOPSWORKS_HOST: ${{ secrets.HOPSWORKS_HOST }}
           HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
           HOPSWORKS_PROJECT_ID: ${{ secrets.HOPSWORKS_PROJECT_ID }}
@@ -93,13 +127,18 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p logs artifacts
+          echo "Running training script..."
+          # Show minimal presence checks (no secret values)
           echo "HOPSWORKS_HOST present: ${HOPSWORKS_HOST:+yes}"
+          echo "HOPSWORKS_API_KEY present: ${HOPSWORKS_API_KEY:+yes}"
+          echo "HOPSWORKS_PROJECT_ID present: ${HOPSWORKS_PROJECT_ID:+yes}"
           if [ -f "train.py" ]; then
             python train.py 2>&1 | tee logs/train.log
           elif [ -f "src/train.py" ]; then
             python src/train.py 2>&1 | tee logs/train.log
           else
             echo "ERROR: train.py not found; aborting."
+            ls -R .
             exit 2
           fi
         shell: bash
@@ -113,22 +152,31 @@ jobs:
             logs
             artifacts
 
+      - name: Post Cache pip
+        if: always()
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}-numpy-1.26.4-sklearn-1.2.2
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
       - name: Debug:confirm features/history timestamps
         run: |
           python - <<'PY'
-            from datetime import datetime, timezone
-            import os, pandas as pd
-            print("now_utc:", datetime.now(timezone.utc))
-            for p in ("features_with_standard_aqi.csv","features_preprocessed.csv","history.csv"):
-                if os.path.exists(p):
-                    try:
-                        df = pd.read_csv(p, parse_dates=["time"])
-                        df['time'] = pd.to_datetime(df['time'], utc=True)
-                        print(f"{p}: rows={len(df)} first={df['time'].min()} last={df['time'].max()}")
-                        print(df.tail(3).to_string(index=False))
-                    except Exception as e:
-                        print("Failed to read",p,":",e)
-                else:
-                    print("Missing:", p)
-          PY
+from datetime import datetime, timezone
+import os, pandas as pd
+print("now_utc:", datetime.now(timezone.utc))
+for p in ("features_with_standard_aqi.csv","features_preprocessed.csv","history.csv"):
+    if os.path.exists(p):
+        try:
+            df = pd.read_csv(p, parse_dates=["time"])
+            df['time'] = pd.to_datetime(df['time'], utc=True)
+            print(f"{p}: rows={len(df)} first={df['time'].min()} last={df['time'].max()}")
+            print(df.tail(3).to_string(index=False))
+        except Exception as e:
+            print("Failed to read",p,":",e)
+    else:
+        print("Missing:", p)
+PY
         shell: bash

@@ -88,6 +88,7 @@ def calc_metrics(y_true, y_pred):
 
     # Compute RMSE without using the 'squared' kwarg to remain compatible across sklearn versions
     try:
+        # mean_squared_error(...) exists across versions; take sqrt for RMSE
         mse_val = float(mean_squared_error(y_true, y_pred))
         rmse_val = float(np.sqrt(mse_val))
     except Exception:
@@ -257,6 +258,13 @@ def register_model_hopsworks(model_path: str, metrics: dict):
 # ---------- main ----------
 def main():
     print("Starting training:", datetime.utcnow().isoformat())
+
+    # debug: print sklearn version if available
+    try:
+        import sklearn
+        print("sklearn version:", sklearn.__version__)
+    except Exception:
+        pass
 
     df = load_df(INPUT_CSV)
     print("Loaded rows:", len(df))

@@ -1,12 +1,10 @@
 # Daily training workflow — retrain/evaluate and register model
-# - Uses Python 3.12 to match local env (you reported 3.12.7)
-# - Force-reinstalls scikit-learn==1.2.2 (matches your local version)
-# - Prints Python/sklearn versions for debugging
-# - Uploads logs/artifacts for inspection
-
+# - Uses Python 3.12 (match local)
+# - Force-reinstalls scikit-learn==1.2.2
+# - DOES NOT fetch Git LFS objects (avoids LFS quota failures)
 on:
   schedule:
-    - cron: '0 2 * * *'  # Daily at 02:00 UTC
+    - cron: '0 2 * * *'
   workflow_dispatch:
 
 concurrency:
@@ -17,22 +15,21 @@ jobs:
   train:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
+      - name: Checkout repository (skip LFS fetch to avoid quota errors)
         uses: actions/checkout@v4
         with:
-          lfs: true
+          lfs: false         # IMPORTANT: do not fetch LFS objects (avoids LFS quota failure)
           fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.12'    # match your local Python 3.12.7
+          python-version: '3.12'
 
       - name: Cache pip
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          # include sklearn version in cache key so changes invalidate cache
           key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}-sklearn-1.2.2
           restore-keys: |
             ${{ runner.os }}-pip-
@@ -42,7 +39,6 @@ jobs:
           set -euo pipefail
           python -m pip install --upgrade pip setuptools wheel
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          # Force reinstall scikit-learn to ensure runner uses the pinned version
           python -m pip install --force-reinstall --no-cache-dir "scikit-learn==1.2.2"
         shell: bash
 
@@ -52,7 +48,6 @@ jobs:
           python -c "import sys; print('sys.executable:', sys.executable)"
           python -c "import sklearn; print('sklearn.__version__ =', sklearn.__version__)"
           pip show scikit-learn || true
-          pip freeze | grep scikit-learn || true
         shell: bash
 
       - name: Prepare .env from secrets (sanitized)
@@ -65,7 +60,6 @@ jobs:
           OPENWEATHER_API_KEY: ${{ secrets.OPENWEATHER_API_KEY }}
         run: |
           set -euo pipefail
-          # sanitize host (strip http(s) scheme and trailing slashes)
           HOST_SANITIZED="$(printf '%s' "$HOPSWORKS_HOST_RAW" | sed -e 's~https\?://~~I' -e 's:/*$::')"
           : > .env
           printf "HOPSWORKS_HOST=%s\n" "$HOST_SANITIZED" >> .env
@@ -74,7 +68,6 @@ jobs:
           printf "HOPSWORKS_FEATURE_GROUP=%s\n" "$HOPSWORKS_FEATURE_GROUP" >> .env
           printf "HOPSWORKS_FEATURE_GROUP_VERSION=%s\n" "$HOPSWORKS_FEATURE_GROUP_VERSION" >> .env
           printf "OPENWEATHER_API_KEY=%s\n" "$OPENWEATHER_API_KEY" >> .env
-          # show redacted preview for debugging (no secrets printed)
           echo ".env preview (keys only):"
           sed -n '1,200p' .env | sed -e 's/=.*/=<REDACTED>/g'
         shell: bash
@@ -108,18 +101,13 @@ jobs:
           echo "Running training script..."
           echo "Working directory:"; pwd
           echo "Top-level files:"; ls -la
-          echo "Contents of src/ (if exists):"; ls -la src || true
           echo "Contents of models/ (if exists):"; ls -la models || true
           echo
           if [ -f "train.py" ]; then
             echo "Found train.py at repository root — running python train.py"
             python train.py 2>&1 | tee logs/train.log
-          elif [ -f "src/train.py" ]; then
-            echo "Found src/train.py — running python src/train.py"
-            python src/train.py 2>&1 | tee logs/train.log
           else
-            echo "ERROR: train.py not found at repo root or src/; aborting."
-            ls -R .
+            echo "ERROR: train.py not found; aborting."
             exit 2
           fi
         shell: bash

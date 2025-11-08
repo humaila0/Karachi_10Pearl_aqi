@@ -35,7 +35,6 @@ jobs:
           key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}-sklearn-1.2.2
           restore-keys: |
             ${{ runner.os }}-pip-
-
       - name: Install dependencies (force scikit-learn 1.2.2)
         run: |
           set -euo pipefail
@@ -132,7 +131,6 @@ jobs:
           path: |
             logs
             artifacts
-
       - name: Post Cache pip
         if: always()
         uses: actions/cache@v4
@@ -141,7 +139,6 @@ jobs:
           key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}-sklearn-1.2.2
           restore-keys: |
             ${{ runner.os }}-pip-
-
       - name: Post Set up Python
         if: always()
         run: echo "Done."

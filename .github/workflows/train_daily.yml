@@ -50,12 +50,10 @@ jobs:
 
       - name: Verify Python / numpy / pandas / sklearn (sanity check)
         run: |
-          python - <<'PY'
-import textwrap, sys, importlib
-code = """
+          python << 'EOF'
 import sys
 import importlib
-names = ('numpy','pandas','sklearn')
+names = ('numpy', 'pandas', 'sklearn')
 print('python', sys.version.splitlines()[0])
 for n in names:
     try:
@@ -63,9 +61,7 @@ for n in names:
         print(n, m.__version__)
     except Exception as e:
         print(n, 'import error:', e)
-"""
-exec(textwrap.dedent(code))
-PY
+EOF
         shell: bash
 
       - name: Prepare .env from secrets (sanitized)
@@ -91,7 +87,7 @@ PY
           sed -n '1,200p' .env | sed -e 's/=.*/=<REDACTED>/g'
         shell: bash
 
-      - name: Optional: HOPSWORKS secrets presence check (no network)
+      - name: Optional - HOPSWORKS secrets presence check (no network)
         env:
           HOPSWORKS_HOST_RAW: ${{ secrets.HOPSWORKS_HOST }}
           HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
@@ -148,15 +144,13 @@ PY
           restore-keys: |
             ${{ runner.os }}-pip-
 
-      - name: Debug: confirm features/history timestamps
+      - name: Debug - confirm features/history timestamps
         run: |
-          python - <<'PY'
-import textwrap
-code = """
+          python << 'EOF'
 from datetime import datetime, timezone
 import os, pandas as pd
 print('now_utc:', datetime.now(timezone.utc))
-for p in ('features_with_standard_aqi.csv','features_preprocessed.csv','history.csv'):
+for p in ('features_with_standard_aqi.csv', 'features_preprocessed.csv', 'history.csv'):
     if os.path.exists(p):
         try:
             df = pd.read_csv(p, parse_dates=['time'])
@@ -164,10 +158,8 @@ for p in ('features_with_standard_aqi.csv','features_preprocessed.csv','history.
             print(f"{p}: rows={len(df)} first={df['time'].min()} last={df['time'].max()}")
             print(df.tail(3).to_string(index=False))
         except Exception as e:
-            print('Failed to read',p,':',e)
+            print('Failed to read', p, ':', e)
     else:
         print('Missing:', p)
-"""
-exec(textwrap.dedent(code))
-PY
+EOF
         shell: bash

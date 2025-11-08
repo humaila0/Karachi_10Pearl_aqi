@@ -1,8 +1,7 @@
 # Daily training workflow — retrain/evaluate and register model
 # - Do NOT fetch Git LFS objects (avoids LFS quota failures)
 # - Uses Python 3.12 to match local environment
-# - Force-installs scikit-learn==1.2.2 (matches local)
-# - Attempts to download model artifacts from Hopsworks into models/ (best-effort)
+# - Installs numpy pinned to 1.26.4 then scikit-learn==1.2.2 to avoid ABI mismatch
 on:
   schedule:
     - cron: '0 2 * * *'  # Daily at 02:00 UTC
@@ -25,31 +24,46 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.12'    # match your local Python 3.12.7
+          python-version: '3.12'
 
-      - name: Cache pip
+      - name: Cache pip (include numpy & sklearn versions in key)
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          # include sklearn version in cache key so changes invalidate cache
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}-sklearn-1.2.2
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}-numpy-1.26.4-sklearn-1.2.2
           restore-keys: |
             ${{ runner.os }}-pip-
-      - name: Install dependencies (force scikit-learn 1.2.2)
+
+      - name: Install dependencies (pin numpy then sklearn)
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip setuptools wheel
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          python -m pip install --force-reinstall --no-cache-dir "scikit-learn==1.2.2"
+          # 1) Pin numpy to the <2.x release that matches pandas 2.1.4 in your local
+          python -m pip install --no-cache-dir --prefer-binary "numpy==1.26.4"
+          # 2) Install other requirements without touching numpy or scikit-learn
+          if [ -f requirements.txt ]; then
+            # create a temporary req file that excludes numpy and scikit-learn lines
+            sed '/^[[:space:]]*numpy/Id; /^[[:space:]]*scikit-learn/Id' requirements.txt > /tmp/reqs_no_np_skl.txt || true
+            pip install --no-cache-dir -r /tmp/reqs_no_np_skl.txt || true
+          fi
+          # 3) Finally install the scikit-learn version you use locally
+          python -m pip install --no-cache-dir --prefer-binary "scikit-learn==1.2.2"
         shell: bash
 
-      - name: Show Python and scikit-learn versions (debug)
+      - name: Verify Python / numpy / pandas / sklearn (sanity check)
         run: |
-          python -V
-          python -c "import sys; print('sys.executable:', sys.executable)"
-          python -c "import sklearn; print('sklearn.__version__ =', sklearn.__version__)"
-          pip show scikit-learn || true
-          pip freeze | grep scikit-learn || true
+          python - <<'PY'
+import sys
+import importlib
+names = ("numpy","pandas","sklearn")
+print("python", sys.version.splitlines()[0])
+for n in names:
+    try:
+        m = importlib.import_module(n)
+        print(n, m.__version__)
+    except Exception as e:
+        print(n, "import error:", e)
+PY
         shell: bash
 
       - name: Prepare .env from secrets (sanitized)
@@ -62,7 +76,6 @@ jobs:
           OPENWEATHER_API_KEY: ${{ secrets.OPENWEATHER_API_KEY }}
         run: |
           set -euo pipefail
-          # sanitize host (strip http(s) scheme and trailing slashes)
           HOST_SANITIZED="$(printf '%s' "$HOPSWORKS_HOST_RAW" | sed -e 's~https\?://~~I' -e 's:/*$::')"
           : > .env
           printf "HOPSWORKS_HOST=%s\n" "$HOST_SANITIZED" >> .env
@@ -71,31 +84,9 @@ jobs:
           printf "HOPSWORKS_FEATURE_GROUP=%s\n" "$HOPSWORKS_FEATURE_GROUP" >> .env
           printf "HOPSWORKS_FEATURE_GROUP_VERSION=%s\n" "$HOPSWORKS_FEATURE_GROUP_VERSION" >> .env
           printf "OPENWEATHER_API_KEY=%s\n" "$OPENWEATHER_API_KEY" >> .env
-          # show redacted preview for debugging (no secrets printed)
           echo ".env preview (keys only):"
           sed -n '1,200p' .env | sed -e 's/=.*/=<REDACTED>/g'
         shell: bash
-
-      - name: "Optional: HOPSWORKS secrets presence check (no network)"
-        env:
-          HOPSWORKS_HOST_RAW: ${{ secrets.HOPSWORKS_HOST }}
-          HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
-          OPENWEATHER_API_KEY: ${{ secrets.OPENWEATHER_API_KEY }}
-        run: |
-          set -euo pipefail
-          echo "HOPSWORKS_HOST set: ${HOPSWORKS_HOST_RAW:+yes}"
-          if [ -z "${HOPSWORKS_API_KEY:-}" ]; then
-            echo "HOPSWORKS_API_KEY: NOT SET"
-          else
-            echo "HOPSWORKS_API_KEY: present (redacted)"
-          fi
-          if [ -z "${OPENWEATHER_API_KEY:-}" ]; then
-            echo "OPENWEATHER_API_KEY: NOT SET"
-          else
-            echo "OPENWEATHER_API_KEY: present (redacted)"
-          fi
-        shell: bash
-        continue-on-error: true
 
       - name: Run training
         id: train
@@ -103,22 +94,12 @@ jobs:
           set -euo pipefail
           mkdir -p logs artifacts
           echo "Running training script..."
-          # Debug listing so we can see where files are on the runner
-          echo "Working directory:"; pwd
-          echo "Top-level files:"; ls -la
-          echo "Contents of src/ (if exists):"; ls -la src || true
-          echo "Contents of models/ (if exists):"; ls -la models || true
-          echo
-          # Prefer repo root train.py (matches your repo); fallback to src/
           if [ -f "train.py" ]; then
-            echo "Found train.py at repository root — running python train.py"
             python train.py 2>&1 | tee logs/train.log
           elif [ -f "src/train.py" ]; then
-            echo "Found src/train.py — running python src/train.py"
             python src/train.py 2>&1 | tee logs/train.log
           else
-            echo "ERROR: train.py not found at repo root or src/; aborting."
-            ls -R .
+            echo "ERROR: train.py not found; aborting."
             exit 2
           fi
         shell: bash
@@ -131,38 +112,32 @@ jobs:
           path: |
             logs
             artifacts
+
       - name: Post Cache pip
         if: always()
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}-sklearn-1.2.2
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}-numpy-1.26.4-sklearn-1.2.2
           restore-keys: |
             ${{ runner.os }}-pip-
-      - name: Post Set up Python
-        if: always()
-        run: echo "Done."
-
-      - name: Post Checkout repository
-        if: always()
-        run: echo "Done."
 
       - name: Debug:confirm features/history timestamps
         run: |
           python - <<'PY'
-          from datetime import datetime, timezone
-          import os, pandas as pd
-          print("now_utc:", datetime.now(timezone.utc))
-          for p in ("features_with_standard_aqi.csv","features_preprocessed.csv","history.csv"):
-              if os.path.exists(p):
-                  try:
-                      df = pd.read_csv(p, parse_dates=["time"])
-                      df['time'] = pd.to_datetime(df['time'], utc=True)
-                      print(f"{p}: rows={len(df)} first={df['time'].min()} last={df['time'].max()}")
-                      print(df.tail(3).to_string(index=False))
-                  except Exception as e:
-                      print("Failed to read",p,":",e)
-              else:
-                  print("Missing:", p)
-          PY
+from datetime import datetime, timezone
+import os, pandas as pd
+print("now_utc:", datetime.now(timezone.utc))
+for p in ("features_with_standard_aqi.csv","features_preprocessed.csv","history.csv"):
+    if os.path.exists(p):
+        try:
+            df = pd.read_csv(p, parse_dates=["time"])
+            df['time'] = pd.to_datetime(df['time'], utc=True)
+            print(f"{p}: rows={len(df)} first={df['time'].min()} last={df['time'].max()}")
+            print(df.tail(3).to_string(index=False))
+        except Exception as e:
+            print("Failed to read",p,":",e)
+    else:
+        print("Missing:", p)
+PY
         shell: bash

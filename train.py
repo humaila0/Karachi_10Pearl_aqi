@@ -1,11 +1,11 @@
 """
-Train RandomForest (and optional XGBoost / LightGBM) for standard_aqi_next_24h,
+Train RandomForest for standard_aqi_next_24h,
 save artifacts locally and upload the RandomForest to Hopsworks Model Registry.
 
 Behavior:
  - Loads environment (.env) via python-dotenv (so HOPSWORKS_* and other flags can be set there).
  - Builds lags/rolls/diffs BEFORE dropping target rows (avoids leakage).
- - Trains RandomForest (and optionally XGBoost / LightGBM if installed).
+ - Trains RandomForest only by default (optional XGBoost / LightGBM if TRAIN_EXTRA_MODELS=true).
  - Saves artifacts to models/: RF model, scaler, feature column order, feature medians.
  - Attempts to register the RF model in Hopsworks model registry if test R² >= REGISTRY_MIN_R2.
  - Prints detailed errors on registry failures (doesn't crash the training run).
@@ -51,6 +51,9 @@ MODEL_DIR = os.getenv("MODEL_DIR", "models")
 REGISTRY_MIN_R2 = float(os.getenv("REGISTRY_MIN_R2", "0.70"))  # only upload if test R² >= threshold
 HOPSWORKS_MODEL_NAME = os.getenv("HOPSWORKS_MODEL_NAME", f"aqi_rf_{TARGET}")
 
+# Control whether to train extra models (XGBoost / LightGBM). Default: False (RF only).
+TRAIN_EXTRA_MODELS = os.getenv("TRAIN_EXTRA_MODELS", "false").lower() in ("1", "true", "yes")
+
 os.makedirs(MODEL_DIR, exist_ok=True)
 
 RF_MODEL_FILE = os.path.join(MODEL_DIR, f"rf_aqi_predictor_{TARGET}.pkl")
@@ -76,11 +79,27 @@ RF_PARAMS = {
 
 
 def calc_metrics(y_true, y_pred):
-    return {
-        "r2": float(r2_score(y_true, y_pred)),
-        "mae": float(mean_absolute_error(y_true, y_pred)),
-        "rmse": float(mean_squared_error(y_true, y_pred, squared=False)),
-    }
+    """
+    Compute common regression metrics in a way compatible with multiple scikit-learn versions.
+    Returns dict with r2, mae, rmse.
+    """
+    r2_val = float(r2_score(y_true, y_pred))
+    mae_val = float(mean_absolute_error(y_true, y_pred))
+
+    # Compute RMSE without using the 'squared' kwarg to remain compatible across sklearn versions
+    try:
+        mse_val = float(mean_squared_error(y_true, y_pred))
+        rmse_val = float(np.sqrt(mse_val))
+    except Exception:
+        # Defensive fallback: manual computation
+        try:
+            arr = np.asarray(y_true) - np.asarray(y_pred)
+            mse_val = float(np.mean(arr ** 2))
+            rmse_val = float(np.sqrt(mse_val))
+        except Exception:
+            rmse_val = float("nan")
+
+    return {"r2": r2_val, "mae": mae_val, "rmse": rmse_val}
 
 
 # ---------- data / feature engineering ----------
@@ -277,9 +296,9 @@ def main():
         rf_metrics_train["r2"], rf_metrics_test["r2"], rf_metrics_test["mae"], rf_metrics_test["rmse"]
     ))
 
-    # 7) optional XGBoost / LightGBM (best-effort)
+    # 7) optional XGBoost / LightGBM (only run if TRAIN_EXTRA_MODELS=true)
     xgb_res = None
-    if XGBRegressor is not None:
+    if TRAIN_EXTRA_MODELS and XGBRegressor is not None:
         try:
             xgb = XGBRegressor(objective="reg:squarederror", n_estimators=500, max_depth=6,
                                learning_rate=0.05, subsample=0.8, colsample_bytree=0.8,
@@ -296,7 +315,7 @@ def main():
             traceback.print_exc()
 
     lgbm_res = None
-    if LGBMRegressor is not None:
+    if TRAIN_EXTRA_MODELS and LGBMRegressor is not None:
         try:
             lgbm = LGBMRegressor(n_estimators=500, learning_rate=0.05, max_depth=6, random_state=RANDOM_STATE)
             lgbm.fit(X_train_s, y_train)

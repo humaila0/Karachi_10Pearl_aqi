@@ -1,45 +1,43 @@
-# Hourly feature ingest + prediction (force use of RandomForest from Hopsworks)
+# Hourly feature ingest + prediction — fetch model from Hopsworks (no Git LFS)
 on:
   schedule:
-    - cron: '0 * * * *'   # At the top of every hour (UTC)
-  workflow_dispatch:     # Allow manual runs from the Actions UI
+    - cron: '0 * * * *'   # hourly
+  workflow_dispatch:
+
 concurrency:
   group: hourly-ingest-predict
   cancel-in-progress: true
+
 jobs:
   ingest_and_predict:
-    name: Ingest features and produce predictions (RF only)
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
+      - name: Checkout repository (do not fetch Git LFS objects)
         uses: actions/checkout@v4
         with:
-          lfs: false  # ✅ DISABLED - Not needed since we use Hopsworks
+          lfs: false
           fetch-depth: 0
+
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.12.7'
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-      - name: Install dependencies (including system libs for confluent-kafka)
+
+      - name: Install system deps & Python packages
         run: |
           sudo apt-get update -y
           sudo apt-get install -y librdkafka-dev build-essential || true
           python -m pip install --upgrade pip setuptools wheel
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          pip install python-dotenv
+          python -m pip install python-dotenv hopsworks joblib || true
         shell: bash
+
       - name: Prepare .env from repository secret 'AQI'
         run: |
           printf "%s\n" "${{ secrets.AQI }}" > .env
           echo "Wrote .env from secrets.AQI (values kept hidden)"
         shell: bash
+
       - name: Run feature pipeline (fetch & ingest)
         id: pipeline
         run: |
@@ -48,16 +46,126 @@ jobs:
           echo "Running feature pipeline..."
           python run_feature_pipeline.py 2>&1 | tee logs/run_feature_pipeline.log
         shell: bash
+
+      - name: Debug: confirm features/history timestamps
+        run: |
+          python - <<'PY'
+import os, pandas as pd
+from datetime import datetime, timezone
+print("now_utc:", datetime.now(timezone.utc))
+for p in ("features_with_standard_aqi.csv","features_preprocessed.csv","history.csv"):
+    if os.path.exists(p):
+        try:
+            df = pd.read_csv(p, parse_dates=["time"])
+            df['time'] = pd.to_datetime(df['time'], utc=True)
+            print(f"{p}: rows={len(df)} first={df['time'].min()} last={df['time'].max()}")
+            print(df.tail(3).to_string(index=False))
+        except Exception as e:
+            print("Failed to read",p,":",e)
+    else:
+        print("Missing:", p)
+PY
+        shell: bash
+
+      - name: Download model artifacts from Hopsworks (best-effort)
+        if: always()
+        env:
+          HOPSWORKS_HOST: ${{ secrets.HOPSWORKS_HOST }}
+          HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
+          HOPSWORKS_PROJECT_ID: ${{ secrets.HOPSWORKS_PROJECT_ID }}
+          # Optional override; set this secret to your exact model name (recommended)
+          HOPSWORKS_MODEL_NAME: ${{ secrets.HOPSWORKS_MODEL_NAME }}
+          HOPSWORKS_MODEL_VERSION: ${{ secrets.HOPSWORKS_MODEL_VERSION }}
+        run: |
+          set -euo pipefail
+          echo "Attempting Hopsworks model download..."
+          python - <<'PY'
+import os, glob, shutil, sys
+from pathlib import Path
+try:
+    import hopsworks
+except Exception as e:
+    print("hopsworks import failed:", e, file=sys.stderr)
+    sys.exit(0)
+
+model_name = os.getenv("HOPSWORKS_MODEL_NAME", "aqi_rf_standard_aqi_next_24h_20251030T153032Z")
+model_version = os.getenv("HOPSWORKS_MODEL_VERSION", "")
+
+try:
+    project = hopsworks.login()
+    mr = project.get_model_registry()
+except Exception as e:
+    print("hopsworks login/get_model_registry failed:", e, file=sys.stderr)
+    sys.exit(0)
+
+entry = None
+# 1) try exact provided name+version
+try:
+    if model_name and model_version:
+        try:
+            entry = mr.get_model(model_name, version=int(model_version))
+        except Exception:
+            entry = None
+    if entry is None and model_name:
+        try:
+            models = mr.get_models(name=model_name)
+            if models:
+                entry = models[0]
+        except Exception:
+            entry = None
+    # 2) fallback: find an RF model by name heuristic if none found
+    if entry is None:
+        for m in mr.get_models():
+            if m and m.name and "aqi_rf" in m.name:
+                entry = m
+                break
+except Exception as e:
+    print("model lookup failed:", e, file=sys.stderr)
+    entry = None
+
+if entry is None:
+    print("No model entry found; skipping download.")
+    sys.exit(0)
+
+print("Downloading model entry:", entry.name)
+try:
+    folder = entry.download()
+except Exception as e:
+    print("download failed:", e, file=sys.stderr)
+    sys.exit(0)
+
+dst = Path("models")
+dst.mkdir(parents=True, exist_ok=True)
+copied = 0
+for p in glob.glob(str(Path(folder) / "**" / "*.pkl"), recursive=True):
+    shutil.copy(p, dst)
+    print("copied", p)
+    copied += 1
+print("copied files:", copied)
+PY
+        shell: bash
+
+      - name: Ensure no stale predictions.csv & inspect models (debug)
+        run: |
+          # avoid silently re-using old predictions.csv
+          rm -f predictions.csv || true
+          echo "models/ listing (size):"
+          ls -lh models || true
+          echo "If any model file exists, show first 64 bytes hexdump to confirm binary pickle (not a pointer):"
+          for f in models/*.pkl models/*.joblib 2>/dev/null; do
+            echo "---- $f ----"
+            head -c 64 "$f" | hexdump -C -n 64 || head -c 64 "$f" | xxd || true
+            stat -c "%n size=%s" "$f" || true
+          done
+        shell: bash
+
       - name: Run predictions (force RandomForest from Hopsworks)
         id: predict
         continue-on-error: true
         env:
-          # Force model selection policy: always try Hopsworks and use the RF model
           MODEL_SOURCE: "hopsworks"
           PREFERRED_MODEL: "rf"
-          # Use the exact RF model name you uploaded to Hopsworks (update if different)
-          HOPSWORKS_MODEL_NAME: "aqi_rf_standard_aqi_next_24h_20251030T153032Z"
-          # Hopsworks / OpenWeather secrets (map from Actions secrets). Optional if .env already contains them.
+          HOPSWORKS_MODEL_NAME: ${{ secrets.HOPSWORKS_MODEL_NAME }}
           HOPSWORKS_HOST: ${{ secrets.HOPSWORKS_HOST }}
           HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
           HOPSWORKS_PROJECT_ID: ${{ secrets.HOPSWORKS_PROJECT_ID }}
@@ -66,17 +174,14 @@ jobs:
           OPENWEATHER_API_KEY: ${{ secrets.OPENWEATHER_API_KEY }}
         run: |
           set -euo pipefail
-          mkdir -p artifacts predictions logs
-          echo "Running prediction script (MODEL_SOURCE=$MODEL_SOURCE, PREFERRED_MODEL=$PREFERRED_MODEL, HOPSWORKS_MODEL_NAME=$HOPSWORKS_MODEL_NAME)..."
-          # Run predict.py; keep output in logs and move produced predictions.csv to artifacts
+          mkdir -p logs artifacts predictions
+          echo "Running prediction script..."
           python predict.py 2>&1 | tee logs/predict_output.txt || true
           if [ -f predictions.csv ]; then mv -f predictions.csv artifacts/ || true; fi
-          # Debug: print which RF-related files exist locally and show head of logs
-          echo "Local models/ listing (for debug):"
-          ls -la models || true
-          echo "Predict logs head:"
+          echo "predict log head:"
           head -n 200 logs/predict_output.txt || true
         shell: bash
+
       - name: Upload logs & artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -84,4 +189,4 @@ jobs:
           path: |
             logs
             artifacts
-            predictions || true
+            predictions

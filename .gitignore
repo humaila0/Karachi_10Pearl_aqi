@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+venv/
+.env
+
+# Project runtime/generated outputs (do NOT commit these)
+predictions.csv
+history.csv
+features_preprocessed.csv
+features_with_standard_aqi.csv
+*.sqlite
+*.db
+
+# Logs, artifacts, temporary output
+logs/
+artifacts/
+predictions/
+tmp/
+*.log
+
+# Models & large binary artifacts (use Git LFS or a model registry instead)
+models/
+*.pkl
+*.joblib
+*.h5
+*.onnx
+
+# Backfill / raw datasets (keep out of repo unless small sample)
+data/
+backfill/
+*.csv
+
+# IDEs / editors
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

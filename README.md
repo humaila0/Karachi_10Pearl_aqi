@@ -96,7 +96,7 @@ Run:
 streamlit run streamlit_app.py
 ```
 
-→ [http://localhost:8501](http://localhost:0009)
+→ [http://localhost:000](http://localhost:0009)
 
 ---
 

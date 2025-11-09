@@ -96,7 +96,7 @@ Run:
 streamlit run streamlit_app.py
 ```
 
-→ [http://localhost:8501](http://localhost:8501)
+→ [http://localhost:8501](http://localhost:0009)
 
 ---
 
@@ -117,4 +117,4 @@ Hopsworks · Streamlit · Plotly · SHAP · GitHub Actions
 ---
 
 **Maintainer:** [@humaila0](https://github.com/humaila0)
-*End-to-end AQI forecasting system with automated retraining, feature store integration, and live dashboard.*
+*End-to-end AQI forecasting system with automated retraining, feature store integration, and dashboard.*

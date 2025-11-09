@@ -1,24 +1,41 @@
-# (Full file — updated to render the Current observation card as a "frozen" colored card)
+# Streamlit app — updated to fetch latest ingestion from Hopsworks and run predictions in-process
+# Includes:
+#  - Plotly interactive charts (hover) with forecast (next 3 days) for pollutants (history plotting removed)
+#  - SHAP summarizer & table + optional beeswarm (runs only when shap and model are available and user opts in)
+#  - Safe fallbacks to synthetic history and synthetic AQI forecast when Hopsworks/predictor unavailable
+
+import os
+import datetime
+import glob
+import traceback
+from typing import Tuple, Optional
+
 import streamlit as st
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
 import joblib
-import hopsworks
-import datetime
-import os
-import subprocess
-import shlex
-import glob
-import concurrent.futures
-import traceback
-from dotenv import load_dotenv
-from typing import Tuple, Optional
 
-# Load environment variables from .env if present
-load_dotenv()
+# Plotly (preferred for interactive charts)
+try:
+    import plotly.graph_objects as go
+    import plotly.express as px
+    PLOTLY_AVAILABLE = True
+except Exception:
+    PLOTLY_AVAILABLE = False
 
-# Try to import local prediction helper
+# Hopsworks and dotenv (optional)
+try:
+    import hopsworks
+except Exception:
+    hopsworks = None
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
+# Try to import the predictor module (prefer in-process)
 try:
     import predict as predictor
 except Exception:
@@ -39,19 +56,33 @@ except Exception:
 st.set_page_config(page_title="Karachi AQI Forecast", page_icon="🌬️", layout="wide")
 
 
-# ---------- small helper to run shell commands ----------
-def run_command(cmd, timeout=300):
-    if isinstance(cmd, (list, tuple)):
-        cmd_list = cmd
-    else:
-        cmd_list = shlex.split(cmd)
+# ---------- compatibility helpers ----------
+def safe_rerun():
     try:
-        proc = subprocess.run(
-            cmd_list, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout
-        )
-        return proc.returncode, proc.stdout, proc.stderr
-    except subprocess.TimeoutExpired as e:
-        return 124, "", f"TimeoutExpired: {e}"
+        if hasattr(st, "experimental_rerun"):
+            try:
+                st.experimental_rerun()
+                return
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        try:
+            from streamlit.runtime.scriptrunner.script_runner import RerunException  # type: ignore
+        except Exception:
+            from streamlit.script_runner import RerunException  # type: ignore
+        raise RerunException()
+    except Exception:
+        pass
+    try:
+        st.session_state["_copilot_force_rerun_flag"] = not st.session_state.get("_copilot_force_rerun_flag", False)
+    except Exception:
+        pass
+    try:
+        st.stop()
+    except Exception:
+        raise RuntimeError("Could not trigger Streamlit rerun; please reload the page manually.")
 
 
 # ---------- small helpers ----------
@@ -65,7 +96,6 @@ def find_local_model(models_dir: str = "models") -> Tuple[Optional[object], Opti
         os.path.join(models_dir, "aqi_predictor.pkl"),
         os.path.join(models_dir, "rf_aqi_predictor_*.pkl"),
         os.path.join(models_dir, "xgb_aqi_predictor_*.pkl"),
-        os.path.join(models_dir, "lgbm_aqi_predictor_*.pkl"),
         os.path.join(models_dir, "*aqi_predictor*.pkl"),
         os.path.join(models_dir, "*.pkl"),
     ]
@@ -87,15 +117,24 @@ def find_local_model(models_dir: str = "models") -> Tuple[Optional[object], Opti
 @st.cache_resource
 def get_hopsworks_project():
     try:
-        proj = hopsworks.login()
-        return proj
+        if hopsworks is None:
+            return None
+        if not os.getenv("HOPSWORKS_API_KEY"):
+            return None
+        try:
+            proj = hopsworks.login()
+            return proj
+        except Exception as e:
+            print("Hopsworks login failed:", e)
+            return None
     except Exception as e:
-        print("Hopsworks login failed:", e)
+        print("Unexpected error in get_hopsworks_project:", e)
         return None
 
 
 @st.cache_resource
 def load_model_and_artifacts_hopsworks(model_name: Optional[str] = None, model_version: Optional[int] = None, allowed_patterns=None):
+    # Fixed: use datetime.datetime.now() (no erroneous datetime.datetime.datetime)
     start = datetime.datetime.now()
     project = get_hopsworks_project()
     if project is None:
@@ -114,9 +153,9 @@ def load_model_and_artifacts_hopsworks(model_name: Optional[str] = None, model_v
             return None, {}, None, None, 0.0
 
         try:
-            folder = run_with_timeout(lambda: entry.download(), timeout=60)
-        except TimeoutError:
-            print("Hopsworks model download timed out after 60s")
+            folder = entry.download()
+        except Exception:
+            print("Hopsworks model download failed or timed out")
             return None, {}, None, None, 0.0
 
         download_time = (datetime.datetime.now() - start).total_seconds()
@@ -151,6 +190,7 @@ def load_model_and_artifacts_hopsworks(model_name: Optional[str] = None, model_v
 
 
 def run_with_timeout(fn, timeout=10, *args, **kwargs):
+    import concurrent.futures
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
         fut = ex.submit(fn, *args, **kwargs)
         try:
@@ -182,15 +222,18 @@ def get_latest_data_from_fg(timeout_seconds: int = 30):
         fg_name = os.getenv("HOPSWORKS_FEATURE_GROUP", "aqi_current")
         fg_version = int(os.getenv("HOPSWORKS_FEATURE_GROUP_VERSION", "1"))
         fg = fs.get_feature_group(name=fg_name, version=fg_version)
-        df = fg.select_all().read().sort_values("time", ascending=False).head(168)
+        try:
+            df = fg.select_all().read().sort_values("time", ascending=False).head(168)
+        except Exception:
+            df = fg.read().sort_values("time", ascending=False).head(168)
         return df.reset_index(drop=True)
     try:
         df = run_with_timeout(_read_fg, timeout_seconds)
         df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
         return df
     except TimeoutError as e:
-      #  st.warning(f"Hopsworks read timed out after {timeout_seconds}s — using fallback data. ({e})")
-        st.warning(f".")
+      st.warning(f".")
+
     except Exception as e:
         st.warning(f"Failed reading Hopsworks feature group: {e}")
         traceback.print_exc()
@@ -205,8 +248,25 @@ def get_latest_data_from_fg(timeout_seconds: int = 30):
     })
 
 
+# ---------- Forecast loader (IN-PROCESS predictor) ----------
 @st.cache_data(ttl=300)
 def load_forecast():
+    try:
+        if predictor is not None and hasattr(predictor, "get_predictions_for_dashboard"):
+            try:
+                ft, preds_us, preds_1to5 = predictor.get_predictions_for_dashboard(use_24h_model=False, prefer_hopsworks=True)
+                df = pd.DataFrame({"time": pd.to_datetime(ft), "us_aqi": preds_us, "aqi_1to5": preds_1to5})
+                df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
+                try:
+                    df.to_csv("predictions.csv", index=False)
+                except Exception:
+                    pass
+                return df.sort_values("time").reset_index(drop=True)
+            except Exception as e:
+                print("[load_forecast] predictor.get_predictions_for_dashboard failed:", e)
+                traceback.print_exc()
+    except Exception:
+        pass
     try:
         if os.path.exists("predictions.csv"):
             df = pd.read_csv("predictions.csv", parse_dates=["time"])
@@ -226,17 +286,6 @@ def load_forecast():
             return df.sort_values("time").reset_index(drop=True)
     except Exception as e:
         print("[load_forecast] Failed reading predictions.csv:", e)
-    try:
-        if predictor is not None and hasattr(predictor, "get_predictions_for_dashboard"):
-            try:
-                ft, preds_us, preds_1to5 = predictor.get_predictions_for_dashboard(use_24h_model=False)
-            except TypeError:
-                ft, preds_us, preds_1to5 = predictor.get_predictions_for_dashboard()
-            df = pd.DataFrame({"time": ft, "us_aqi": preds_us, "aqi_1to5": preds_1to5})
-            df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
-            return df.sort_values("time").reset_index(drop=True)
-    except Exception as e:
-        print("[load_forecast] predictor.get_predictions_for_dashboard failed:", e)
     ft = pd.date_range(start=pd.Timestamp.now(tz="UTC") + pd.Timedelta(hours=1), periods=72, freq="H", tz="UTC")
     preds_1to5 = np.clip(np.random.normal(3, 0.8, 72), 1, 5).astype(int)
     preds_us = preds_1to5 * 50
@@ -308,6 +357,68 @@ def us_aqi_category_and_color(aqi_value):
     return "Hazardous", "#7B241C"
 
 
+# ---- SHAP summarizer helper ----
+def summarize_shap(shap_exp, X, top_k=10):
+    vals = shap_exp.values
+    if isinstance(vals, list):
+        vals_arr = np.array(vals[0])
+    else:
+        vals_arr = np.array(vals)
+    if vals_arr.ndim > 2:
+        vals_arr = vals_arr[:, :, 0]
+    if vals_arr.ndim == 1:
+        vals_arr = vals_arr.reshape(-1, 1)
+    n_samples, n_features = vals_arr.shape
+    feat_names = list(X.columns)
+
+    mean_abs = np.mean(np.abs(vals_arr), axis=0)
+    mean_signed = np.mean(vals_arr, axis=0)
+    median = np.median(vals_arr, axis=0)
+    std = np.std(vals_arr, axis=0)
+    pos_frac = np.mean(vals_arr > 0, axis=0)
+    neg_frac = np.mean(vals_arr < 0, axis=0)
+
+    df = pd.DataFrame({
+        "feature": feat_names,
+        "mean_abs_shap": mean_abs,
+        "mean_shap": mean_signed,
+        "median_shap": median,
+        "std_shap": std,
+        "pos_fraction": pos_frac,
+        "neg_fraction": neg_frac,
+    })
+    df = df.sort_values("mean_abs_shap", ascending=False).reset_index(drop=True)
+
+    top_pos = df[df["mean_shap"] > 0].sort_values("mean_shap", ascending=False).head(top_k)
+    top_neg = df[df["mean_shap"] < 0].sort_values("mean_shap").head(top_k)
+
+    def fmt_list(df_slice, n=5):
+        return ", ".join([f"{row.feature} ({row.mean_shap:.2f})" for _, row in df_slice.head(n).iterrows()])
+
+    summary_lines = []
+    if not top_pos.empty:
+        summary_lines.append(
+            f"Top features that increase predicted AQI (avg positive SHAP): {fmt_list(top_pos, n=min(5, len(top_pos)))}."
+        )
+    else:
+        summary_lines.append("No features with a clear positive average contribution found.")
+
+    if not top_neg.empty:
+        summary_lines.append(
+            f"Top features that decrease predicted AQI (avg negative SHAP): {fmt_list(top_neg, n=min(5, len(top_neg)))}."
+        )
+    else:
+        summary_lines.append("No features with a clear negative average contribution found.")
+
+    summary_lines.append(
+        "The table below lists top features by average absolute SHAP (importance magnitude). "
+        "mean_abs_shap gives the importance magnitude; mean_shap shows the average direction (+ increases prediction, - decreases)."
+    )
+
+    summary_text = " ".join(summary_lines)
+    return df, summary_text
+
+
 def main():
     st.markdown(
         """
@@ -319,7 +430,6 @@ def main():
         .kpi-value {font-size:36px;font-weight:700;margin-top:6px;}
         .kpi-label {color:rgba(255,255,255,0.85);font-size:13px;}
         .small-note {color:#bdbdbd;font-size:13px;margin-top:8px;}
-        /* frozen card styling: sticky + shadow */
         .frozen-card { position: -webkit-sticky; position: sticky; top:20px; box-shadow: 0 8px 20px rgba(0,0,0,0.45); border: 1px solid rgba(255,255,255,0.04); }
         </style>
         """,
@@ -329,48 +439,55 @@ def main():
     st.markdown('<div class="title">Karachi Air Quality Forecast</div>', unsafe_allow_html=True)
     st.markdown('<div class="subtitle">Historical data, live current AQI (OpenWeather) and forecast (next 3 days).</div>', unsafe_allow_html=True)
 
-    # Sidebar (unchanged)
+    # Sidebar controls
     with st.sidebar:
         st.header("Controls")
         horizon = st.selectbox("Forecast horizon (hours shown)", options=[24, 48, 72], index=2)
         smoothing = st.slider("Smoothing window (hours)", 1, 24, 3)
         show_pm = st.multiselect("Show pollutant charts", options=["pm2_5", "pm10"], default=["pm2_5", "pm10"])
-        show_shap = st.checkbox("Show SHAP explanations (if available)", value=False)
+        shap_possible = True
+        try:
+            import shap  # type: ignore
+        except Exception:
+            shap_possible = False
+        show_shap = st.checkbox("Show SHAP explanations (if available)", value=False, help="SHAP can be heavy — only enable when model & features are available.")
+        st.markdown("---")
+        st.markdown("Visual options")
+        use_plotly = st.checkbox("Use interactive Plotly charts (hover tooltips, zoom)", value=(PLOTLY_AVAILABLE and True), disabled=not PLOTLY_AVAILABLE)
+        show_markers = st.checkbox("Show markers on forecast (high/low)", value=True)
         st.markdown("---")
         st.markdown("Refresh predictions")
         refresh_days = st.selectbox("Select days to fetch", options=[1, 3], index=1, format_func=lambda x: f"{x} day(s)")
         if st.button("Refresh predictions now"):
             load_forecast.clear()
             get_latest_data_from_fg.clear()
-            st.info("Refreshing predictions... this may take 20-90s.")
+            st.info("Refreshing predictions... this may take 10-90s.")
             ran_ok = False
             msg = ""
             if predictor is not None and hasattr(predictor, "get_predictions_for_dashboard"):
                 try:
-                    ft, us, one5 = predictor.get_predictions_for_dashboard(use_24h_model=False)
+                    ft, us, one5 = predictor.get_predictions_for_dashboard(use_24h_model=False, prefer_hopsworks=True)
                     dfp = pd.DataFrame({"time": ft, "us_aqi": us, "aqi_1to5": one5})
                     try:
                         dfp["time"] = pd.to_datetime(dfp["time"], utc=True)
                     except Exception:
                         dfp["time"] = pd.to_datetime(dfp["time"], errors="coerce")
                         dfp["time"] = dfp["time"].dt.tz_localize("UTC", ambiguous="NaT", nonexistent="NaT")
-                    dfp.to_csv("predictions.csv", index=False)
+                    try:
+                        dfp.to_csv("predictions.csv", index=False)
+                    except Exception:
+                        pass
                     ran_ok = True
-                    msg = "Predictions regenerated via predictor module (requested full 72h)."
+                    msg = "Predictions regenerated via predictor module (Hopsworks preferred)."
                 except Exception as e:
                     msg = f"predictor.get_predictions_for_dashboard failed: {e}"
+                    traceback.print_exc()
             if not ran_ok:
-                cmd = f"{os.sys.executable} -u src/predict.py"
-                rc, out, err = run_command(cmd, timeout=240)
-                if rc == 0:
-                    ran_ok = True
-                    msg = "Predictions regenerated via src/predict.py (subprocess)."
-                else:
-                    msg = f"Subprocess predict.py failed (rc={rc}). stderr: {err[:1000]}"
+                msg = msg or "No predictor module available and no local predictions.csv present; using fallback synthetic forecast."
             st.success(msg)
             load_forecast.clear()
             get_latest_data_from_fg.clear()
-            st.experimental_rerun()
+            safe_rerun()
 
     # Load data
     forecast_df = load_forecast()
@@ -444,7 +561,6 @@ def main():
         )
     with cols[1]:
         cur_aqi_display = f"{cur_aqi:.0f}" if cur_aqi is not None and not pd.isna(cur_aqi) else "N/A"
-        # Use the frozen-card class so it remains visually "frozen"/sticky and colored
         st.markdown(
             f"""
             <div class="card frozen-card" style="background:{current_card_color};">
@@ -452,7 +568,7 @@ def main():
                 <div style="margin-top:6px">
                     <div class="kpi-label">Current AQI (US)</div>
                     <div class="kpi-value">{cur_aqi_display}</div>
-                    <div class="kpi-label" style="margin-top:8px">Time (UTC):</div>
+                    <div class="kpi-label" style="margin-top:10px">Time (UTC):</div>
                     <div style="font-weight:600;color:rgba(255,255,255,0.95)">{cur_time_display}</div>
                     <div style="margin-top:8px" class="kpi-label">Category:</div>
                     <div style="font-weight:700;color:rgba(255,255,255,0.95)">{cur_cat_label}</div>
@@ -464,7 +580,7 @@ def main():
 
     st.markdown("<br>", unsafe_allow_html=True)
 
-    # Re-add full 72h forecast table with AQI category label
+    # Forecast table & download
     st.markdown("### Forecast table — next 3 days (72 hours, model predictions)")
     if not forecast_df.empty:
         display_df = forecast_df.copy()
@@ -493,166 +609,352 @@ def main():
     else:
         st.info("No forecast data available for the next 3 days.")
 
-    # Charts (unchanged)...
-    st.markdown("## Forecast charts & pollutant history")
+    # Charts
+    st.markdown("## Forecast charts & pollutant forecast")
+
+    # -- Forecast chart: use Plotly (interactive hover) when available --
     try:
-        fig, ax1 = plt.subplots(figsize=(12, 4))
-        if not fdf.empty:
-            ax1.plot(fdf["time"], fdf["us_aqi"], color="tab:blue", lw=2, label="US AQI")
-            ax1.fill_between(fdf["time"], fdf["us_aqi"], color="tab:blue", alpha=0.08)
-        ax1.set_ylabel("US AQI", color="tab:blue")
-        if st.checkbox("Show 1-5 series on same chart", value=True):
-            ax2 = ax1.twinx()
+        use_plotly_local = (PLOTLY_AVAILABLE and use_plotly)
+        if use_plotly_local:
+            fig = go.Figure()
             if not fdf.empty:
-                ax2.plot(fdf["time"], fdf["aqi_1to5"], color="tab:orange", lw=2, label="AQI (1-5)")
-            ax2.set_ylabel("AQI (1-5)", color="tab:orange")
-        ax1.set_xlabel("Time (UTC)")
-        ax1.grid(alpha=0.2)
-        try:
-            ax1.set_xticklabels([t.strftime("%m-%d %H:%M") for t in fdf["time"].iloc[::max(1, len(fdf) // 8)]], rotation=30)
-        except Exception:
-            pass
-        ax1.legend(loc="upper left")
-        st.pyplot(fig)
+                fig.add_trace(
+                    go.Scatter(
+                        x=fdf["time"],
+                        y=fdf["us_aqi"],
+                        name="US AQI",
+                        mode="lines+markers" if show_markers else "lines",
+                        line=dict(color="royalblue", width=3),
+                        fill="tozeroy",
+                        fillcolor="rgba(65, 105, 225, 0.08)",
+                        hovertemplate="<b>%{x|%Y-%m-%d %H:%M}</b><br>US AQI: %{y:.0f}<extra></extra>",
+                        yaxis="y1",
+                    )
+                )
+                fig.add_trace(
+                    go.Scatter(
+                        x=fdf["time"],
+                        y=fdf["aqi_1to5"],
+                        name="AQI (1-5)",
+                        mode="lines+markers" if show_markers else "lines",
+                        line=dict(color="orange", width=2, dash="dash"),
+                        hovertemplate="<b>%{x|%Y-%m-%d %H:%M}</b><br>AQI (1-5): %{y:.1f}<extra></extra>",
+                        yaxis="y2",
+                    )
+                )
+                try:
+                    idx_max = int(fdf["us_aqi"].idxmax())
+                    max_time = fdf.loc[idx_max, "time"]
+                    max_val = fdf.loc[idx_max, "us_aqi"]
+                    fig.add_trace(
+                        go.Scatter(
+                            x=[max_time],
+                            y=[max_val],
+                            mode="markers+text" if show_markers else "markers",
+                            marker=dict(color="red", size=10),
+                            name="Max (US AQI)",
+                            text=[f"Max: {max_val:.0f}"],
+                            textposition="top center",
+                            hovertemplate="<b>%{x|%Y-%m-%d %H:%M}</b><br>Max US AQI: %{y:.0f}<extra></extra>",
+                            yaxis="y1",
+                        )
+                    )
+                except Exception:
+                    pass
+
+            fig.update_layout(
+                xaxis=dict(title="Time (UTC)"),
+                yaxis=dict(title="US AQI", side="left", rangemode="tozero"),
+                yaxis2=dict(title="AQI (1-5)", overlaying="y", side="right", rangemode="tozero"),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                margin=dict(l=40, r=40, t=40, b=40),
+                template="plotly_white",
+                height=380,
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            import matplotlib.pyplot as plt
+            fig, ax1 = plt.subplots(figsize=(12, 4))
+            if not fdf.empty:
+                ax1.plot(fdf["time"], fdf["us_aqi"], color="tab:blue", lw=2, label="US AQI")
+                ax1.fill_between(fdf["time"], fdf["us_aqi"], color="tab:blue", alpha=0.08)
+            ax1.set_ylabel("US AQI", color="tab:blue")
+            if st.checkbox("Show 1-5 series on same chart", value=True):
+                ax2 = ax1.twinx()
+                if not fdf.empty:
+                    ax2.plot(fdf["time"], fdf["aqi_1to5"], color="tab:orange", lw=2, label="AQI (1-5)")
+                ax2.set_ylabel("AQI (1-5)", color="tab:orange")
+            ax1.set_xlabel("Time (UTC)")
+            ax1.grid(alpha=0.2)
+            try:
+                ax1.set_xticklabels([t.strftime("%m-%d %H:%M") for t in fdf["time"].iloc[::max(1, len(fdf) // 8)]], rotation=30)
+            except Exception:
+                pass
+            ax1.legend(loc="upper left")
+            st.pyplot(fig)
     except Exception:
         st.info("Unable to render forecast chart.")
 
+    # -- Pollutant forecast only: use Plotly interactive series (with smoothing) --
     if show_pm:
-        st.markdown("### Recent pollutant history (last 7 days)")
+        st.markdown("### Pollutant forecast — next 3 days (forecast only)")
         for pollutant in show_pm:
-            pfig, pax = plt.subplots(figsize=(12, 2.5))
-            if pollutant in hist.columns:
-                series = hist[pollutant].astype(float).iloc[::-1]
-                times = pd.to_datetime(hist["time"].iloc[::-1])
-                pax.plot(times, series, label=pollutant, color="tab:red" if pollutant == "pm2_5" else "tab:green")
-                pax.plot(times, series.rolling(smoothing, min_periods=1).mean(), linestyle="--", color="black", label=f"{smoothing}h MA")
-                pax.set_ylabel(pollutant)
-                pax.set_xlabel("Time (UTC)")
-                pax.grid(alpha=0.2)
-                pax.legend()
-                st.pyplot(pfig)
-            else:
-                st.info(f"No column '{pollutant}' in feature store data to plot.")
+            try:
+                # Forecast series (next horizon hours) from fdf if present
+                has_fc = pollutant in fdf.columns
+                if has_fc:
+                    fc_series = fdf[pollutant].astype(float).reset_index(drop=True)
+                    fc_times = pd.to_datetime(fdf["time"]).reset_index(drop=True)
+                else:
+                    # If forecast pollutant missing, synthesize using recent history pattern when available
+                    if hist is not None and pollutant in hist.columns:
+                        horizon_len = len(fdf) if not fdf.empty else int(horizon)
+                        pattern_len = min(72, len(hist), horizon_len)
+                        if pattern_len <= 0:
+                            st.info(f"No data available to produce a forecast for '{pollutant}'.")
+                            continue
+                        recent_pattern = hist[pollutant].astype(float).iloc[::-1].values[:pattern_len][::-1]
+                        repeats = int(np.ceil(horizon_len / pattern_len))
+                        extended = np.tile(recent_pattern, repeats)[:horizon_len].astype(float)
+                        hist_std = float(np.nanstd(recent_pattern)) if pattern_len > 1 else max(1.0, float(np.nanmedian(recent_pattern)) * 0.05)
+                        noise_scale = 0.25
+                        rng = np.random.RandomState(42)
+                        noise = rng.normal(loc=0.0, scale=hist_std * noise_scale, size=horizon_len)
+                        synth_vals = np.maximum(0.0, extended + noise)
+                        if not fdf.empty:
+                            fc_times = pd.to_datetime(fdf["time"]).reset_index(drop=True)
+                        else:
+                            start = pd.Timestamp.now(tz="UTC") + pd.Timedelta(hours=1)
+                            fc_times = pd.date_range(start=start, periods=horizon_len, freq="H", tz="UTC")
+                            fc_times = pd.Series(fc_times)
+                        fc_series = pd.Series(synth_vals)
+                        has_fc = True
+                    else:
+                        st.info(f"No forecast or history available to plot '{pollutant}'.")
+                        continue
 
+                # compute forecast smoothing
+                fc_smoothed = fc_series.rolling(smoothing, min_periods=1, center=True).mean() if smoothing > 1 else fc_series
+
+                # Plot only forecast traces (no history)
+                use_plotly_plots = (PLOTLY_AVAILABLE and use_plotly)
+                if use_plotly_plots:
+                    pfig = go.Figure()
+                    pfig.add_trace(
+                        go.Scatter(
+                            x=fc_times,
+                            y=fc_series,
+                            name=f"{pollutant} (forecast)",
+                            mode="lines+markers",
+                            line=dict(color="rgba(255,165,0,0.9)", width=2, dash="dot"),
+                            marker=dict(symbol="circle-open", size=6),
+                            hovertemplate="<b>%{x|%Y-%m-%d %H:%M}</b><br>Forecast " + pollutant + ": %{y:.1f}<extra></extra>",
+                        )
+                    )
+                    try:
+                        pfig.add_trace(
+                            go.Scatter(
+                                x=fc_times,
+                                y=fc_smoothed,
+                                name=f"{smoothing}h MA (forecast)",
+                                mode="lines",
+                                line=dict(color="rgba(255,165,0,0.6)", width=2, dash="dash"),
+                                hovertemplate="<b>%{x|%Y-%m-%d %H:%M}</b><br>Forecast smoothed: %{y:.1f}<extra></extra>",
+                            )
+                        )
+                    except Exception:
+                        pass
+
+                    pfig.update_layout(
+                        template="plotly_white",
+                        height=260,
+                        margin=dict(l=30, r=30, t=20, b=30),
+                        xaxis_title="Time (UTC)",
+                        yaxis_title=pollutant,
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+                    )
+                    st.plotly_chart(pfig, use_container_width=True)
+                else:
+                    import matplotlib.pyplot as plt
+                    pfig, pax = plt.subplots(figsize=(12, 2.5))
+                    pax.plot(fc_times, fc_series, linestyle=":", color="orange", marker="o", markersize=3, label=f"{pollutant} (forecast)")
+                    try:
+                        pax.plot(fc_times, fc_smoothed, linestyle="--", color="orange", label=f"{smoothing}h MA (forecast)")
+                    except Exception:
+                        pass
+                    pax.set_ylabel(pollutant)
+                    pax.set_xlabel("Time (UTC)")
+                    pax.grid(alpha=0.2)
+                    pax.legend()
+                    st.pyplot(pfig)
+
+            except Exception as e:
+                st.warning(f"Failed rendering pollutant forecast chart for {pollutant}: {e}")
+
+    # SHAP explanations (only attempt when user opted in and all prerequisites present)
     if show_shap:
         st.markdown("## SHAP explanations (model interpretability)")
         try:
-            mdl, artifacts, mdl_path, folder, dt = load_model_and_artifacts_hopsworks()
-            if mdl is None:
-                mdl, mdl_path = find_local_model()
-                artifacts = {}
-                source = "local" if mdl is not None else None
+            try:
+                import shap  # type: ignore
+                shap_installed = True
+            except Exception:
+                shap_installed = False
+            if not shap_installed:
+                st.info("SHAP library is not installed. Install shap and restart the app to enable SHAP explanations.")
             else:
-                source = "hopsworks"
-
-            if mdl is None:
-                st.info("No model artifact found locally or in Hopsworks. SHAP unavailable.")
-            else:
-                st.success(f"Using model from {source}: {mdl_path}")
-                expected = getattr(mdl, "n_features_in_", None)
-                st.write("Model expects n_features_in_:", expected)
-                feature_cols = None
-                medians = None
-                for k, v in artifacts.items():
-                    kl = k.lower()
-                    if ("feature_cols" in kl or "feature_list" in kl or "feature_names" in kl):
-                        if isinstance(v, (list, tuple, pd.Index)):
-                            feature_cols = list(v)
-                            break
-                        if isinstance(v, pd.DataFrame):
-                            feature_cols = list(v.iloc[:, 0].values)
-                            break
-                for k, v in artifacts.items():
-                    kl = k.lower()
-                    if "median" in kl or "medians" in kl or "feature_medians" in kl:
-                        medians = v
-                        break
-                try:
-                    X_sample = hist.copy().head(100)
-                except Exception:
-                    X_sample = None
-                if X_sample is None or X_sample.empty:
-                    st.info("Not enough recent history rows to compute SHAP sample.")
+                mdl, artifacts, mdl_path, folder, dt = load_model_and_artifacts_hopsworks()
+                if mdl is None:
+                    mdl, mdl_path = find_local_model()
+                    artifacts = {}
+                    source = "local" if mdl is not None else None
                 else:
-                    if feature_cols:
-                        X = pd.DataFrame(index=X_sample.index, columns=feature_cols, dtype=float)
-                        for c in feature_cols:
-                            if c in X_sample.columns:
-                                X[c] = X_sample[c].values
-                            else:
-                                X[c] = np.nan
-                    else:
-                        X = X_sample.select_dtypes(include=[np.number]).copy()
-                    X = X.apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan)
-                    if medians is not None and isinstance(medians, (dict, pd.Series)):
-                        for c in X.columns:
-                            if X[c].isna().any():
-                                fill = medians.get(c) if isinstance(medians, dict) else (medians[c] if c in medians else None)
-                                if fill is not None and not pd.isna(fill):
-                                    X[c].fillna(float(fill), inplace=True)
-                    if expected is not None:
-                        if X.shape[1] < expected:
-                            if feature_cols and len(feature_cols) >= expected:
-                                pass
-                            else:
-                                for i in range(expected - X.shape[1]):
-                                    X[f"pad_extra_{i}"] = 0.0
-                        elif X.shape[1] > expected:
-                            if feature_cols:
-                                keep = [c for c in feature_cols if c in X.columns][:expected]
-                                X = X[keep]
-                            else:
-                                X = X.iloc[:, :expected]
+                    source = "hopsworks"
+                if mdl is None:
+                    st.info("No model artifact found locally or in Hopsworks. SHAP unavailable.")
+                else:
+                    st.success(f"Using model from {source}: {mdl_path}")
+                    expected = getattr(mdl, "n_features_in_", None)
+                    st.write("Model expects n_features_in_:", expected)
+
+                    feature_cols = None
+                    medians = None
+                    for k, v in artifacts.items():
+                        kl = k.lower()
+                        if ("feature_cols" in kl or "feature_list" in kl or "feature_names" in kl):
+                            if isinstance(v, (list, tuple, pd.Index)):
+                                feature_cols = list(v)
+                                break
+                            if isinstance(v, pd.DataFrame):
+                                feature_cols = list(v.iloc[:, 0].values)
+                                break
+                    for k, v in artifacts.items():
+                        kl = k.lower()
+                        if "median" in kl or "medians" in kl or "feature_medians" in kl:
+                            medians = v
+                            break
+
                     try:
-                        X = X.fillna(X.median().to_dict())
+                        X_sample = hist.copy().head(100)
                     except Exception:
-                        X = X.fillna(0.0)
-                    if X.isna().any().any():
-                        X = X.fillna(0.0)
-                    X = X.astype(float)
-                    st.write("Prepared SHAP input shape:", X.shape)
-                    try:
-                        import shap
-                        name = type(mdl).__name__.lower()
-                        estimator = mdl
-                        try:
-                            if hasattr(mdl, "named_steps") and "model" in mdl.named_steps:
-                                estimator = mdl.named_steps["model"]
-                        except Exception:
-                            estimator = mdl
-                        if any(k in name for k in ("randomforest", "xgb", "lightgbm", "lgbm", "catboost", "forest")) or "sklearn.ensemble" in str(type(estimator)):
-                            explainer = shap.TreeExplainer(estimator)
+                        X_sample = None
+                    if X_sample is None or X_sample.empty:
+                        st.info("Not enough recent history rows to compute SHAP sample.")
+                    else:
+                        if feature_cols:
+                            X = pd.DataFrame(index=X_sample.index, columns=feature_cols, dtype=float)
+                            for c in feature_cols:
+                                if c in X_sample.columns:
+                                    X[c] = X_sample[c].values
+                                else:
+                                    X[c] = np.nan
                         else:
-                            explainer = shap.Explainer(mdl.predict, X)
-                        shap_exp = explainer(X)
+                            X = X_sample.select_dtypes(include=[np.number]).copy()
+                        X = X.apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan)
+                        if medians is not None and isinstance(medians, (dict, pd.Series)):
+                            for c in X.columns:
+                                if X[c].isna().any():
+                                    fill = medians.get(c) if isinstance(medians, dict) else (medians[c] if c in medians else None)
+                                    if fill is not None and not pd.isna(fill):
+                                        X[c].fillna(float(fill), inplace=True)
+                        if expected is not None:
+                            if X.shape[1] < expected:
+                                if feature_cols and len(feature_cols) >= expected:
+                                    pass
+                                else:
+                                    for i in range(expected - X.shape[1]):
+                                        X[f"pad_extra_{i}"] = 0.0
+                            elif X.shape[1] > expected:
+                                if feature_cols:
+                                    keep = [c for c in feature_cols if c in X.columns][:expected]
+                                    X = X[keep]
+                                else:
+                                    X = X.iloc[:, :expected]
                         try:
-                            shap.plots.beeswarm(shap_exp, show=False)
-                            fig = plt.gcf()
-                            st.pyplot(fig)
-                            plt.clf()
-                        except Exception as e_plot:
-                            st.warning(f"SHAP beeswarm plot failed: {e_plot}. Showing textual SHAP importances.")
-                            vals = shap_exp.values
-                            if isinstance(vals, list):
-                                vals_arr = np.array(vals[0])
+                            X = X.fillna(X.median().to_dict())
+                        except Exception:
+                            X = X.fillna(0.0)
+                        if X.isna().any().any():
+                            X = X.fillna(0.0)
+                        X = X.astype(float)
+                        st.write("Prepared SHAP input shape:", X.shape)
+
+                        try:
+                            import shap as _shap  # type: ignore
+                            name = type(mdl).__name__.lower()
+                            estimator = mdl
+                            try:
+                                if hasattr(mdl, "named_steps") and "model" in mdl.named_steps:
+                                    estimator = mdl.named_steps["model"]
+                            except Exception:
+                                estimator = mdl
+                            if any(k in name for k in ("randomforest", "xgb", "lightgbm", "lgbm", "catboost", "forest")) or "sklearn.ensemble" in str(type(estimator)):
+                                explainer = _shap.TreeExplainer(estimator)
                             else:
-                                vals_arr = np.array(vals)
-                            if vals_arr.ndim == 1:
-                                vals_arr = vals_arr.reshape(1, -1)
-                            mean_abs = np.mean(np.abs(vals_arr), axis=0)
-                            feat_names = list(X.columns)
-                            imp_df = pd.DataFrame({"feature": feat_names, "mean_abs_shap": mean_abs})
-                            imp_df = imp_df.sort_values("mean_abs_shap", ascending=False).reset_index(drop=True)
-                            st.table(imp_df.head(30))
-                    except Exception as e_shap:
-                        st.error(f"SHAP computation failed: {e_shap}")
-                        traceback.print_exc()
+                                explainer = _shap.Explainer(mdl.predict, X)
+                            shap_exp = explainer(X)
+
+                            # SHAP summary table and text
+                            try:
+                                shap_df, shap_summary_text = summarize_shap(shap_exp, X, top_k=15)
+                                st.markdown("### SHAP summary")
+                                st.markdown(shap_summary_text)
+
+                                top_n = min(15, shap_df.shape[0])
+                                display_table = shap_df.head(top_n).copy()
+                                display_table["mean_abs_shap"] = display_table["mean_abs_shap"].round(4)
+                                display_table["mean_shap"] = display_table["mean_shap"].round(4)
+                                display_table["pos_fraction"] = (display_table["pos_fraction"] * 100).round(1).astype(str) + "%"
+                                display_table["neg_fraction"] = (display_table["neg_fraction"] * 100).round(1).astype(str) + "%"
+
+                                st.table(display_table[["feature", "mean_abs_shap", "mean_shap", "pos_fraction", "neg_fraction"]].rename(columns={
+                                    "feature": "Feature",
+                                    "mean_abs_shap": "Mean |SHAP|",
+                                    "mean_shap": "Mean SHAP",
+                                    "pos_fraction": "% positive",
+                                    "neg_fraction": "% negative",
+                                }))
+
+                                try:
+                                    if PLOTLY_AVAILABLE:
+                                        fig_imp = px.bar(shap_df.head(top_n).iloc[::-1], x="mean_abs_shap", y="feature", orientation="h",
+                                                         labels={"mean_abs_shap": "Mean |SHAP| (importance)", "feature": ""})
+                                        st.plotly_chart(fig_imp, use_container_width=True)
+                                    else:
+                                        import matplotlib.pyplot as plt
+                                        fig_imp, ax = plt.subplots(figsize=(6, max(2, top_n * 0.35)))
+                                        subset = shap_df.head(top_n).iloc[::-1]
+                                        ax.barh(subset["feature"], subset["mean_abs_shap"], color="cornflowerblue")
+                                        ax.set_xlabel("Mean |SHAP| (importance)")
+                                        ax.set_title("Top SHAP feature importances")
+                                        plt.tight_layout()
+                                        st.pyplot(fig_imp)
+                                except Exception as e_plot_imp:
+                                    st.warning(f"Could not render SHAP importance chart: {e_plot_imp}")
+
+                            except Exception as e_sum:
+                                st.warning(f"SHAP summarization failed: {e_sum}")
+                                traceback.print_exc()
+
+                            # Try beeswarm (optional)
+                            try:
+                                _shap.plots.beeswarm(shap_exp, show=False)
+                                import matplotlib.pyplot as plt
+                                fig = plt.gcf()
+                                st.pyplot(fig)
+                                plt.clf()
+                            except Exception as e_plot:
+                                st.warning(f"SHAP beeswarm plot failed: {e_plot}. (Summary shown instead.)")
+                        except Exception as e_shap:
+                            st.error(f"SHAP computation failed: {e_shap}")
+                            traceback.print_exc()
         except Exception as e:
             st.error(f"Explanation block failed: {e}")
             traceback.print_exc()
 
     st.markdown("---")
-    st.caption("Notes: Current AQI above is fetched live from OpenWeather (not predicted). Forecast metrics shown above are generated by the model (US AQI).")
+    st.caption("Notes: Current AQI above is fetched live from OpenWeather (not predicted). Forecast metrics shown above are generated by the model prediction (US AQI). Pollutant forecast lines appear only when forecast data contains pm2_5/pm10; otherwise a synthetic forecast is shown for layout/debugging. SHAP can be heavy and only runs when you opt-in and prerequisites (model & shap) are available.")
+
 
 if __name__ == "__main__":
     main()
